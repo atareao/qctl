@@ -1,0 +1,10 @@
+[package]
+name = "qctl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
+tokio = { version = "1", features = ["full"] }
