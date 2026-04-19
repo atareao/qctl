@@ -65,6 +65,7 @@ qctl install
 qctl uninstall
 qctl start [SERVICE]
 qctl stop [SERVICE]
+qctl restart [SERVICE]
 qctl status [SERVICE] [--compact]
 qctl clean-volumes
 qctl check <QUADLET>
@@ -80,6 +81,7 @@ cargo run -- start voicebox
 cargo run -- status
 cargo run -- status --compact
 cargo run -- stop voicebox
+cargo run -- restart voicebox
 cargo run -- clean-volumes
 cargo run -- check quadlets/voicebox.container
 cargo run -- logs voicebox

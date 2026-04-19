@@ -41,6 +41,11 @@ enum Commands {
         /// Service name, with or without .container extension
         service: Option<String>,
     },
+    /// Restart all container units or one specific service
+    Restart {
+        /// Service name, with or without .container extension
+        service: Option<String>,
+    },
     /// Show status for all container units or one specific service
     Status {
         /// Service name, with or without .container extension
@@ -102,6 +107,10 @@ async fn main() -> Result<()> {
         }
         Commands::Stop { service } => {
             stop(&ctx, service.clone()).await?;
+            status(&ctx, service, false).await?;
+        }
+        Commands::Restart { service } => {
+            restart(&ctx, service.clone()).await?;
             status(&ctx, service, false).await?;
         }
         Commands::Status { service, compact } => status(&ctx, service, compact).await?,
@@ -216,6 +225,22 @@ async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
 
         let _ = systemctl_user("stop", &unit).await;
         debug!("Stopped {unit}");
+    }
+
+    Ok(())
+}
+
+async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
+    let targets = resolve_targets(&ctx.source_dir, service).await?;
+    for unit in targets {
+        let unit_file = ctx.target_dir.join(format!("{unit}.container"));
+        if !path_exists(&unit_file).await? {
+            debug!("Skipping {unit} (not linked in target dir)");
+            continue;
+        }
+
+        let _ = systemctl_user("restart", &unit).await;
+        debug!("Restarted {unit}");
     }
 
     Ok(())
