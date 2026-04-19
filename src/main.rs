@@ -5,6 +5,8 @@ use clap::{Parser, Subcommand};
 use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Cell, Color, Table};
 use tokio::fs;
 use tokio::process::Command;
+use tracing::debug;
+use tracing_subscriber::EnvFilter;
 
 const QUADLET_EXTENSIONS: &[&str] = &[
     "container",
@@ -74,14 +76,34 @@ struct AppContext {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .without_time()
+        .init();
+
     let cli = Cli::parse();
     let ctx = AppContext::new()?;
 
     match cli.command {
-        Commands::Install => install(&ctx).await?,
-        Commands::Uninstall => uninstall(&ctx).await?,
-        Commands::Start { service } => start(&ctx, service).await?,
-        Commands::Stop { service } => stop(&ctx, service).await?,
+        Commands::Install => {
+            install(&ctx).await?;
+            status(&ctx, None, false).await?;
+        }
+        Commands::Uninstall => {
+            uninstall(&ctx).await?;
+            status(&ctx, None, false).await?;
+        }
+        Commands::Start { service } => {
+            start(&ctx, service.clone()).await?;
+            status(&ctx, service, false).await?;
+        }
+        Commands::Stop { service } => {
+            stop(&ctx, service.clone()).await?;
+            status(&ctx, service, false).await?;
+        }
         Commands::Status { service, compact } => status(&ctx, service, compact).await?,
         Commands::CleanVolumes => clean_volumes(&ctx).await?,
         Commands::Check { quadlet } => check_quadlet(&ctx, quadlet).await?,
@@ -111,7 +133,7 @@ impl AppContext {
 }
 
 async fn install(ctx: &AppContext) -> Result<()> {
-    println!(
+    debug!(
         "Installing quadlets from {} into {}",
         ctx.source_dir.display(),
         ctx.target_dir.display()
@@ -126,16 +148,16 @@ async fn install(ctx: &AppContext) -> Result<()> {
         let name = basename(&src)?;
         let dest = ctx.target_dir.join(&name);
         link_or_replace(&src, &dest).await?;
-        println!("Linked {} -> {}", src.display(), dest.display());
+        debug!("Linked {} -> {}", src.display(), dest.display());
     }
 
     daemon_reload().await?;
-    println!("Install complete");
+    debug!("Install complete");
     Ok(())
 }
 
 async fn uninstall(ctx: &AppContext) -> Result<()> {
-    println!(
+    debug!(
         "Stopping services and removing symlinks from {}",
         ctx.target_dir.display()
     );
@@ -153,17 +175,17 @@ async fn uninstall(ctx: &AppContext) -> Result<()> {
 
         if ext == "container" {
             let _ = systemctl_user("stop", &stem).await;
-            println!("Stopped {stem} (if running)");
+            debug!("Stopped {stem} (if running)");
         }
 
         fs::remove_file(&target)
             .await
             .with_context(|| format!("failed to remove {}", target.display()))?;
-        println!("Removed {}", target.display());
+        debug!("Removed {}", target.display());
     }
 
     daemon_reload().await?;
-    println!("Uninstall complete");
+    debug!("Uninstall complete");
     Ok(())
 }
 
@@ -172,12 +194,12 @@ async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
     for unit in targets {
         let unit_file = ctx.target_dir.join(format!("{unit}.container"));
         if !path_exists(&unit_file).await? {
-            println!("Skipping {unit} (not linked in target dir)");
+            debug!("Skipping {unit} (not linked in target dir)");
             continue;
         }
 
         let _ = systemctl_user("start", &unit).await;
-        println!("Started {unit}");
+        debug!("Started {unit}");
     }
 
     Ok(())
@@ -188,12 +210,12 @@ async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
     for unit in targets {
         let unit_file = ctx.target_dir.join(format!("{unit}.container"));
         if !path_exists(&unit_file).await? {
-            println!("Skipping {unit} (not linked in target dir)");
+            debug!("Skipping {unit} (not linked in target dir)");
             continue;
         }
 
         let _ = systemctl_user("stop", &unit).await;
-        println!("Stopped {unit}");
+        debug!("Stopped {unit}");
     }
 
     Ok(())
@@ -301,7 +323,7 @@ async fn status(ctx: &AppContext, service: Option<String>, compact: bool) -> Res
 }
 
 async fn clean_volumes(ctx: &AppContext) -> Result<()> {
-    println!("Removing podman volumes declared in .volume files");
+    debug!("Removing podman volumes declared in .volume files");
 
     let mut entries = fs::read_dir(&ctx.source_dir)
         .await
@@ -318,19 +340,19 @@ async fn clean_volumes(ctx: &AppContext) -> Result<()> {
             .with_context(|| format!("failed to read {}", path.display()))?;
 
         let Some(volume_name) = parse_volume_name(&content) else {
-            println!("Skipping {} (VolumeName not found)", path.display());
+            debug!("Skipping {} (VolumeName not found)", path.display());
             continue;
         };
 
         let _ = run_command("podman", &["volume", "rm", "-f", &volume_name], true).await;
-        println!("Removed volume: {volume_name}");
+        debug!("Removed volume: {volume_name}");
     }
 
     Ok(())
 }
 
 async fn check_quadlet(ctx: &AppContext, quadlet: String) -> Result<()> {
-    println!("Checking {quadlet}");
+    debug!("Checking {quadlet}");
     run_command(
         "/usr/lib/podman/quadlet",
         &["-dryrun", "-user", &ctx.user, &quadlet],
@@ -475,6 +497,8 @@ async fn systemctl_user(action: &str, unit: &str) -> Result<()> {
 }
 
 async fn run_command(cmd: &str, args: &[&str], allow_failure: bool) -> Result<()> {
+    debug!("Running command: {} {}", cmd, args.join(" "));
+
     let status = Command::new(cmd)
         .args(args)
         .status()
