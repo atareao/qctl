@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -74,7 +75,7 @@ enum Commands {
 }
 
 struct AppContext {
-    source_dir: PathBuf,
+    source_dirs: Vec<PathBuf>,
     target_dir: PathBuf,
     user: String,
 }
@@ -126,7 +127,7 @@ async fn main() -> Result<()> {
 impl AppContext {
     fn new() -> Result<Self> {
         let root_dir = std::env::current_dir().context("failed to resolve current directory")?;
-        let source_dir = root_dir.join("quadlets");
+        let source_dirs = discover_source_dirs(&root_dir);
 
         let home = std::env::var("HOME").context("HOME is not set")?;
         let target_dir = Path::new(&home).join(".config/containers/systemd");
@@ -134,17 +135,25 @@ impl AppContext {
         let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
 
         Ok(Self {
-            source_dir,
+            source_dirs,
             target_dir,
             user,
         })
+    }
+
+    fn source_display(&self) -> String {
+        self.source_dirs
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
 async fn install(ctx: &AppContext) -> Result<()> {
     debug!(
         "Installing quadlets from {} into {}",
-        ctx.source_dir.display(),
+        ctx.source_display(),
         ctx.target_dir.display()
     );
 
@@ -152,7 +161,7 @@ async fn install(ctx: &AppContext) -> Result<()> {
         .await
         .with_context(|| format!("failed to create {}", ctx.target_dir.display()))?;
 
-    let files = collect_quadlets(&ctx.source_dir).await?;
+    let files = collect_quadlets(&ctx.source_dirs).await?;
     for src in files {
         let name = basename(&src)?;
         let dest = ctx.target_dir.join(&name);
@@ -171,7 +180,7 @@ async fn uninstall(ctx: &AppContext) -> Result<()> {
         ctx.target_dir.display()
     );
 
-    let files = collect_quadlets(&ctx.source_dir).await?;
+    let files = collect_quadlets(&ctx.source_dirs).await?;
     for src in files {
         let name = basename(&src)?;
         let stem = strip_dot_extension(&name);
@@ -199,7 +208,9 @@ async fn uninstall(ctx: &AppContext) -> Result<()> {
 }
 
 async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
-    let targets = resolve_targets(&ctx.source_dir, service).await?;
+    let targets = resolve_targets(&ctx.source_dirs, service).await?;
+    ensure_targets_installed(ctx, &targets).await?;
+
     for unit in targets {
         let unit_file = ctx.target_dir.join(format!("{unit}.container"));
         if !path_exists(&unit_file).await? {
@@ -214,8 +225,29 @@ async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
     Ok(())
 }
 
+async fn ensure_targets_installed(ctx: &AppContext, targets: &[String]) -> Result<()> {
+    let mut missing_targets = Vec::new();
+
+    for unit in targets {
+        let unit_file = ctx.target_dir.join(format!("{unit}.container"));
+        if !path_exists(&unit_file).await? {
+            missing_targets.push(unit.clone());
+        }
+    }
+
+    if missing_targets.is_empty() {
+        return Ok(());
+    }
+
+    debug!(
+        "Missing links for {}. Installing quadlets first.",
+        missing_targets.join(", ")
+    );
+    install(ctx).await
+}
+
 async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
-    let targets = resolve_targets(&ctx.source_dir, service).await?;
+    let targets = resolve_targets(&ctx.source_dirs, service).await?;
     for unit in targets {
         let unit_file = ctx.target_dir.join(format!("{unit}.container"));
         if !path_exists(&unit_file).await? {
@@ -231,7 +263,7 @@ async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
 }
 
 async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
-    let targets = resolve_targets(&ctx.source_dir, service).await?;
+    let targets = resolve_targets(&ctx.source_dirs, service).await?;
     for unit in targets {
         let unit_file = ctx.target_dir.join(format!("{unit}.container"));
         if !path_exists(&unit_file).await? {
@@ -247,15 +279,15 @@ async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
 }
 
 async fn status(ctx: &AppContext, service: Option<String>, compact: bool) -> Result<()> {
-    let targets = resolve_targets(&ctx.source_dir, service).await?;
+    let targets = resolve_targets(&ctx.source_dirs, service).await?;
 
     if targets.is_empty() {
-        println!("No container units found in {}", ctx.source_dir.display());
+        println!("No container units found in {}", ctx.source_display());
         return Ok(());
     }
 
     if !compact {
-        println!("Source: {}", ctx.source_dir.display());
+        println!("Source: {}", ctx.source_display());
         println!("Target: {}", ctx.target_dir.display());
         println!();
     }
@@ -350,12 +382,8 @@ async fn status(ctx: &AppContext, service: Option<String>, compact: bool) -> Res
 async fn clean_volumes(ctx: &AppContext) -> Result<()> {
     debug!("Removing podman volumes declared in .volume files");
 
-    let mut entries = fs::read_dir(&ctx.source_dir)
-        .await
-        .with_context(|| format!("failed to read {}", ctx.source_dir.display()))?;
-
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
+    let files = collect_quadlets(&ctx.source_dirs).await?;
+    for path in files {
         if extension_of_path(&path) != Some("volume") {
             continue;
         }
@@ -402,18 +430,26 @@ async fn logs(service: String, extra: bool) -> Result<()> {
     Ok(())
 }
 
-async fn resolve_targets(source_dir: &Path, service: Option<String>) -> Result<Vec<String>> {
+fn discover_source_dirs(root_dir: &Path) -> Vec<PathBuf> {
+    let mut source_dirs = Vec::with_capacity(2);
+    let nested_quadlets_dir = root_dir.join("quadlets");
+
+    if nested_quadlets_dir.is_dir() {
+        source_dirs.push(nested_quadlets_dir);
+    }
+
+    source_dirs.push(root_dir.to_path_buf());
+    source_dirs
+}
+
+async fn resolve_targets(source_dirs: &[PathBuf], service: Option<String>) -> Result<Vec<String>> {
     if let Some(svc) = service {
         return Ok(vec![strip_dot_extension(&svc)]);
     }
 
     let mut out = Vec::new();
-    let mut entries = fs::read_dir(source_dir)
-        .await
-        .with_context(|| format!("failed to read {}", source_dir.display()))?;
-
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
+    let files = collect_quadlets(source_dirs).await?;
+    for path in files {
         if extension_of_path(&path) == Some("container") {
             out.push(strip_dot_extension(&basename(&path)?));
         }
@@ -424,18 +460,34 @@ async fn resolve_targets(source_dir: &Path, service: Option<String>) -> Result<V
     Ok(out)
 }
 
-async fn collect_quadlets(source_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut entries = fs::read_dir(source_dir)
-        .await
-        .with_context(|| format!("failed to read {}", source_dir.display()))?;
-
+async fn collect_quadlets(source_dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        let Some(ext) = extension_of_path(&path) else {
-            continue;
-        };
-        if QUADLET_EXTENSIONS.contains(&ext) {
+    let mut seen = HashMap::new();
+
+    for source_dir in source_dirs {
+        let mut entries = fs::read_dir(source_dir)
+            .await
+            .with_context(|| format!("failed to read {}", source_dir.display()))?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let Some(ext) = extension_of_path(&path) else {
+                continue;
+            };
+            if !QUADLET_EXTENSIONS.contains(&ext) {
+                continue;
+            }
+
+            let name = basename(&path)?;
+            if let Some(previous) = seen.insert(name.clone(), path.clone()) {
+                return Err(anyhow!(
+                    "duplicate quadlet file name '{}' found in {} and {}",
+                    name,
+                    previous.display(),
+                    path.display()
+                ));
+            }
+
             out.push(path);
         }
     }
