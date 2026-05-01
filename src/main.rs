@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -54,6 +56,11 @@ enum Commands {
         /// Compact output format for scripts
         #[arg(long)]
         compact: bool,
+    },
+    /// Interactive table to start, stop, restart or inspect services
+    Menu {
+        /// Optional service filter, with or without .container extension
+        service: Option<String>,
     },
     /// Remove podman volumes declared in .volume files
     CleanVolumes,
@@ -115,6 +122,7 @@ async fn main() -> Result<()> {
             status(&ctx, service, false).await?;
         }
         Commands::Status { service, compact } => status(&ctx, service, compact).await?,
+        Commands::Menu { service } => menu(&ctx, service).await?,
         Commands::CleanVolumes => clean_volumes(&ctx).await?,
         Commands::Check { quadlet } => check_quadlet(&ctx, quadlet).await?,
         Commands::Logs { service } => logs(service, false).await?,
@@ -208,7 +216,7 @@ async fn uninstall(ctx: &AppContext) -> Result<()> {
 }
 
 async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
-    let targets = resolve_targets(&ctx.source_dirs, service).await?;
+    let targets = resolve_targets(ctx, service).await?;
     ensure_targets_installed(ctx, &targets).await?;
 
     for unit in targets {
@@ -247,7 +255,7 @@ async fn ensure_targets_installed(ctx: &AppContext, targets: &[String]) -> Resul
 }
 
 async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
-    let targets = resolve_targets(&ctx.source_dirs, service).await?;
+    let targets = resolve_targets(ctx, service).await?;
     for unit in targets {
         let unit_file = ctx.target_dir.join(format!("{unit}.container"));
         if !path_exists(&unit_file).await? {
@@ -263,7 +271,7 @@ async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
 }
 
 async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
-    let targets = resolve_targets(&ctx.source_dirs, service).await?;
+    let targets = resolve_targets(ctx, service).await?;
     for unit in targets {
         let unit_file = ctx.target_dir.join(format!("{unit}.container"));
         if !path_exists(&unit_file).await? {
@@ -279,7 +287,7 @@ async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
 }
 
 async fn status(ctx: &AppContext, service: Option<String>, compact: bool) -> Result<()> {
-    let targets = resolve_targets(&ctx.source_dirs, service).await?;
+    let targets = resolve_targets(ctx, service).await?;
 
     if targets.is_empty() {
         println!("No container units found in {}", ctx.source_display());
@@ -379,6 +387,166 @@ async fn status(ctx: &AppContext, service: Option<String>, compact: bool) -> Res
     Ok(())
 }
 
+async fn menu(ctx: &AppContext, service: Option<String>) -> Result<()> {
+    loop {
+        let rows = service_rows(ctx, service.clone()).await?;
+        if rows.is_empty() {
+            println!("No container units found in {}", ctx.source_display());
+            return Ok(());
+        }
+
+        print!("\x1B[2J\x1B[H");
+        println!("Source: {}", ctx.source_display());
+        println!("Target: {}", ctx.target_dir.display());
+        println!();
+        print_menu_table(&rows);
+        println!();
+        println!("Actions: number = toggle, s = start, p = stop, r = restart, l = logs, q = quit");
+        print!("Selection: ");
+        io::stdout().flush().context("failed to flush stdout")?;
+
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .context("failed to read selection")?;
+        let input = input.trim();
+        if input.is_empty() {
+            continue;
+        }
+        if matches!(input, "q" | "quit" | "exit") {
+            break;
+        }
+
+        let parts = input.split_whitespace().collect::<Vec<_>>();
+        let (index, action) = parse_menu_selection(&parts)?;
+        let Some(row) = rows.get(index.saturating_sub(1)) else {
+            println!("Invalid selection: {index}");
+            wait_for_enter()?;
+            continue;
+        };
+
+        let action = action.unwrap_or(if row.running { "p" } else { "s" });
+        match action {
+            "s" | "start" => start(ctx, Some(row.unit.clone())).await?,
+            "p" | "stop" => stop(ctx, Some(row.unit.clone())).await?,
+            "r" | "restart" => restart(ctx, Some(row.unit.clone())).await?,
+            "l" | "logs" => {
+                print!("\x1B[2J\x1B[H");
+                println!("Recent logs for {}", row.unit);
+                println!();
+                recent_logs(&row.unit).await?;
+                println!();
+                wait_for_enter()?;
+            }
+            other => {
+                println!("Unknown action: {other}");
+                wait_for_enter()?;
+                continue;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+struct ServiceRow {
+    unit: String,
+    linked: bool,
+    running: bool,
+}
+
+async fn service_rows(ctx: &AppContext, service: Option<String>) -> Result<Vec<ServiceRow>> {
+    let targets = resolve_targets(ctx, service).await?;
+    let mut rows = Vec::with_capacity(targets.len());
+
+    for unit in targets {
+        let linked = path_exists(&ctx.target_dir.join(format!("{unit}.container"))).await?;
+        let running = if linked {
+            is_active(&unit).await.unwrap_or(false)
+        } else {
+            false
+        };
+
+        rows.push(ServiceRow {
+            unit,
+            linked,
+            running,
+        });
+    }
+
+    Ok(rows)
+}
+
+fn print_menu_table(rows: &[ServiceRow]) {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_header(vec!["#", "Link", "State", "Action", "Unit"]);
+
+    for (index, row) in rows.iter().enumerate() {
+        let link_txt = if row.linked { "✅" } else { "❌" };
+        let state_txt = if row.running {
+            "🟢 running"
+        } else if row.linked {
+            "🟡 stopped"
+        } else {
+            "⚫ missing"
+        };
+        let action_txt = if row.running {
+            "p stop | r restart | l logs"
+        } else if row.linked {
+            "s start | l logs"
+        } else {
+            "s install+start"
+        };
+
+        let link_color = if row.linked { Color::Green } else { Color::Red };
+        let state_color = if row.running {
+            Color::Green
+        } else if row.linked {
+            Color::Yellow
+        } else {
+            Color::DarkGrey
+        };
+
+        table.add_row(vec![
+            Cell::new(index + 1),
+            Cell::new(link_txt).fg(link_color),
+            Cell::new(state_txt).fg(state_color),
+            Cell::new(action_txt),
+            Cell::new(&row.unit),
+        ]);
+    }
+
+    println!("{table}");
+}
+
+fn parse_menu_selection<'a>(parts: &[&'a str]) -> Result<(usize, Option<&'a str>)> {
+    if parts.is_empty() {
+        return Err(anyhow!("empty selection"));
+    }
+
+    if let Ok(index) = parts[0].parse::<usize>() {
+        return Ok((index, parts.get(1).copied()));
+    }
+
+    let Some(index) = parts.get(1).and_then(|value| value.parse::<usize>().ok()) else {
+        return Err(anyhow!("use: <number> [action] or <action> <number>"));
+    };
+    Ok((index, Some(parts[0])))
+}
+
+fn wait_for_enter() -> Result<()> {
+    print!("Press Enter to continue...");
+    io::stdout().flush().context("failed to flush stdout")?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to wait for enter")?;
+    Ok(())
+}
+
 async fn clean_volumes(ctx: &AppContext) -> Result<()> {
     debug!("Removing podman volumes declared in .volume files");
 
@@ -416,18 +584,38 @@ async fn check_quadlet(ctx: &AppContext, quadlet: String) -> Result<()> {
 }
 
 async fn logs(service: String, extra: bool) -> Result<()> {
+    let unit = systemd_unit(&service);
     if extra {
-        run_command("journalctl", &["--user", "-xsfu", &service], false).await?;
+        run_command("journalctl", &["--user", "-xsfu", &unit], false).await?;
     } else {
         run_command(
             "journalctl",
-            &["--user", "-u", &service, "-f", "--since", "1 hour ago"],
+            &["--user", "-u", &unit, "-f", "--since", "1 hour ago"],
             false,
         )
         .await?;
     }
 
     Ok(())
+}
+
+async fn recent_logs(service: &str) -> Result<()> {
+    let unit = systemd_unit(service);
+    run_command(
+        "journalctl",
+        &[
+            "--user",
+            "-u",
+            &unit,
+            "--since",
+            "1 hour ago",
+            "-n",
+            "80",
+            "--no-pager",
+        ],
+        true,
+    )
+    .await
 }
 
 fn discover_source_dirs(root_dir: &Path) -> Vec<PathBuf> {
@@ -442,16 +630,25 @@ fn discover_source_dirs(root_dir: &Path) -> Vec<PathBuf> {
     source_dirs
 }
 
-async fn resolve_targets(source_dirs: &[PathBuf], service: Option<String>) -> Result<Vec<String>> {
+async fn resolve_targets(ctx: &AppContext, service: Option<String>) -> Result<Vec<String>> {
     if let Some(svc) = service {
         return Ok(vec![strip_dot_extension(&svc)]);
     }
 
     let mut out = Vec::new();
-    let files = collect_quadlets(source_dirs).await?;
+    let files = collect_quadlets(&ctx.source_dirs).await?;
     for path in files {
         if extension_of_path(&path) == Some("container") {
             out.push(strip_dot_extension(&basename(&path)?));
+        }
+    }
+
+    if path_exists(&ctx.target_dir).await? {
+        let installed_files = collect_quadlets(&[ctx.target_dir.clone()]).await?;
+        for path in installed_files {
+            if extension_of_path(&path) == Some("container") {
+                out.push(strip_dot_extension(&basename(&path)?));
+            }
         }
     }
 
@@ -561,23 +758,38 @@ async fn daemon_reload() -> Result<()> {
 }
 
 async fn is_active(unit: &str) -> Result<bool> {
-    let status = Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", unit])
-        .status()
+    let unit = systemd_unit(unit);
+    let output = Command::new("systemctl")
+        .args(["--user", "is-active", &unit])
+        .output()
         .await
         .context("failed to execute systemctl")?;
-    Ok(status.success())
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "active")
 }
 
 async fn systemctl_user(action: &str, unit: &str) -> Result<()> {
-    run_command("systemctl", &["--user", action, unit], true).await
+    let unit = systemd_unit(unit);
+    run_command("systemctl", &["--user", action, &unit], true).await
+}
+
+fn systemd_unit(unit: &str) -> String {
+    if unit.contains('.') {
+        unit.to_string()
+    } else {
+        format!("{unit}.service")
+    }
 }
 
 async fn run_command(cmd: &str, args: &[&str], allow_failure: bool) -> Result<()> {
     debug!("Running command: {} {}", cmd, args.join(" "));
 
-    let status = Command::new(cmd)
-        .args(args)
+    let mut command = Command::new(cmd);
+    command.args(args);
+    if allow_failure {
+        command.stderr(Stdio::null());
+    }
+
+    let status = command
         .status()
         .await
         .with_context(|| format!("failed to execute {cmd}"))?;
