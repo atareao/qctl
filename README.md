@@ -68,6 +68,7 @@ qctl start [SERVICE]
 qctl stop [SERVICE]
 qctl restart [SERVICE]
 qctl status [SERVICE] [--compact]
+qctl menu [SERVICE]
 qctl clean-volumes
 qctl check <QUADLET>
 qctl logs <SERVICE>
@@ -81,6 +82,7 @@ cargo run -- install
 cargo run -- start voicebox
 cargo run -- status
 cargo run -- status --compact
+cargo run -- menu
 cargo run -- stop voicebox
 cargo run -- restart voicebox
 cargo run -- clean-volumes
@@ -89,6 +91,21 @@ cargo run -- logs voicebox
 ```
 
 `qctl start` también sirve como atajo de instalación inicial: si faltan enlaces en `$HOME/.config/containers/systemd`, ejecuta la instalación antes de hacer `start`.
+
+## Menú interactivo
+
+`qctl menu` muestra una tabla interactiva de servicios y permite arrancar, parar, reiniciar o consultar logs sin recordar todos los comandos.
+
+Acciones disponibles:
+
+- `número`: alterna entre arrancar y parar según el estado actual
+- `s número` o `número s`: arranca el servicio
+- `p número` o `número p`: para el servicio
+- `r número` o `número r`: reinicia el servicio
+- `l número` o `número l`: muestra logs recientes y vuelve al menú
+- `q`: sale del menú
+
+El menú también incluye unidades ya enlazadas en `$HOME/.config/containers/systemd`, aunque se ejecute desde otro directorio.
 
 ## Salida de status
 
