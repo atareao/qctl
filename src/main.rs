@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Cell, Color, Table};
 use tokio::fs;
 use tokio::process::Command;
@@ -72,6 +73,12 @@ enum Commands {
         /// Systemd user unit name
         service: String,
     },
+    /// Generate shell completions
+    #[command(hide = true)]
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
+    },
 }
 
 struct AppContext {
@@ -91,6 +98,12 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if let Commands::Completions { shell } = cli.command {
+        generate(shell, &mut Cli::command(), "qctl", &mut std::io::stdout());
+        return Ok(());
+    }
+
     let ctx = AppContext::new()?;
 
     match cli.command {
@@ -119,6 +132,7 @@ async fn main() -> Result<()> {
         Commands::Check { quadlet } => check_quadlet(&ctx, quadlet).await?,
         Commands::Logs { service } => logs(service, false).await?,
         Commands::Logsf { service } => logs(service, true).await?,
+        Commands::Completions { .. } => unreachable!(),
     }
 
     Ok(())
