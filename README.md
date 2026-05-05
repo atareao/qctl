@@ -72,6 +72,7 @@ qctl clean-volumes
 qctl check <QUADLET>
 qctl logs <SERVICE>
 qctl logsf <SERVICE>
+qctl completions <SHELL>
 ```
 
 ## Ejemplos
@@ -89,6 +90,21 @@ cargo run -- logs voicebox
 ```
 
 `qctl start` también sirve como atajo de instalación inicial: si faltan enlaces en `$HOME/.config/containers/systemd`, ejecuta la instalación antes de hacer `start`.
+
+## Completions de shell
+
+Genera e instala completions para tu shell:
+
+```bash
+# Fish
+qctl completions fish > ~/.config/fish/completions/qctl.fish
+
+# Bash
+qctl completions bash > ~/.local/share/bash-completion/completions/qctl
+
+# Zsh
+qctl completions zsh > "${fpath[1]}/_qctl"
+```
 
 ## Salida de status
 
