@@ -69,10 +69,18 @@ qctl stop [SERVICE]
 qctl restart [SERVICE]
 qctl status [SERVICE] [--compact]
 qctl menu [SERVICE]
-qctl clean-volumes
+qctl clean-volumes [--yes]
 qctl check <QUADLET>
 qctl logs <SERVICE>
 qctl logsf <SERVICE>
+```
+
+Todos los comandos aceptan `--dry-run` para mostrar las acciones sin cambiar archivos ni llamar a herramientas externas:
+
+```bash
+qctl --dry-run install
+qctl --dry-run start voicebox
+qctl --dry-run clean-volumes
 ```
 
 ## Ejemplos
@@ -86,6 +94,7 @@ cargo run -- menu
 cargo run -- stop voicebox
 cargo run -- restart voicebox
 cargo run -- clean-volumes
+cargo run -- clean-volumes --yes
 cargo run -- check quadlets/voicebox.container
 cargo run -- logs voicebox
 ```
@@ -107,6 +116,10 @@ Acciones disponibles:
 
 El menú también incluye unidades ya enlazadas en `$HOME/.config/containers/systemd`, aunque se ejecute desde otro directorio.
 
+## Limpieza de volúmenes
+
+`qctl clean-volumes` elimina los volúmenes de Podman declarados con `VolumeName=` en archivos `.volume`. Por defecto pide confirmación antes de borrar. Usa `--yes` para confirmar desde scripts, o `--dry-run` para ver qué volúmenes se borrarían.
+
 ## Salida de status
 
 En la tabla de `status` se usan emojis para facilitar lectura rápida:
@@ -120,6 +133,12 @@ En la tabla de `status` se usan emojis para facilitar lectura rápida:
   - `⚫` n/a
 
 El resumen final también incluye estos estados con su significado.
+
+Con `--compact`, la salida contiene solo una línea por unidad en formato tabulado:
+
+```text
+<unit>	<link>	<state>
+```
 
 ## Estructura esperada
 

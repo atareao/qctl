@@ -11,23 +11,31 @@ jobs:
   build-linux:
     name: Build Linux Binary
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
           target: x86_64-unknown-linux-musl
 
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --verbose
+
       - name: Install musl-tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      
+
       - name: Build release binary
         run: |
-          # Estas variables fuerzan a que todo sea estático
           export RUSTFLAGS="-C target-feature=+crt-static"
           cargo build --release --target x86_64-unknown-linux-musl
 
@@ -40,18 +48,17 @@ jobs:
         run: |
           cd target/x86_64-unknown-linux-musl/release
           mv qctl qctl-linux-x86_64
-      
+
       - name: Generate SHA256 checksum
         run: |
           cd target/x86_64-unknown-linux-musl/release
           sha256sum qctl-linux-x86_64 > qctl-linux-x86_64.sha256
-      
+
       - name: Upload Release Assets
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             target/x86_64-unknown-linux-musl/release/qctl-linux-x86_64
             target/x86_64-unknown-linux-musl/release/qctl-linux-x86_64.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-

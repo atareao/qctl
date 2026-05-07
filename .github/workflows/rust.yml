@@ -11,11 +11,18 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
+    - name: Check formatting
+      run: cargo fmt -- --check
+    - name: Run clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+    - name: Install cargo-audit
+      run: cargo install cargo-audit --locked
+    - name: Audit dependencies
+      run: cargo audit
     - name: Build
       run: cargo build --verbose
     - name: Run tests

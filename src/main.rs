@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -24,6 +24,9 @@ const QUADLET_EXTENSIONS: &[&str] = &[
 #[command(name = "qctl")]
 #[command(about = "Manage quadlets", long_about = None)]
 struct Cli {
+    /// Print what would be done without changing files or calling external tools
+    #[arg(long, global = true)]
+    dry_run: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -63,7 +66,11 @@ enum Commands {
         service: Option<String>,
     },
     /// Remove podman volumes declared in .volume files
-    CleanVolumes,
+    CleanVolumes {
+        /// Confirm removal without prompting
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Check one quadlet file with /usr/lib/podman/quadlet
     Check {
         /// Quadlet file path
@@ -85,6 +92,7 @@ struct AppContext {
     source_dirs: Vec<PathBuf>,
     target_dir: PathBuf,
     user: String,
+    dry_run: bool,
 }
 
 #[tokio::main]
@@ -98,7 +106,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let ctx = AppContext::new()?;
+    let ctx = AppContext::new(cli.dry_run)?;
 
     match cli.command {
         Commands::Install => {
@@ -123,7 +131,7 @@ async fn main() -> Result<()> {
         }
         Commands::Status { service, compact } => status(&ctx, service, compact).await?,
         Commands::Menu { service } => menu(&ctx, service).await?,
-        Commands::CleanVolumes => clean_volumes(&ctx).await?,
+        Commands::CleanVolumes { yes } => clean_volumes(&ctx, yes).await?,
         Commands::Check { quadlet } => check_quadlet(&ctx, quadlet).await?,
         Commands::Logs { service } => logs(service, false).await?,
         Commands::Logsf { service } => logs(service, true).await?,
@@ -133,7 +141,7 @@ async fn main() -> Result<()> {
 }
 
 impl AppContext {
-    fn new() -> Result<Self> {
+    fn new(dry_run: bool) -> Result<Self> {
         let root_dir = std::env::current_dir().context("failed to resolve current directory")?;
         let source_dirs = discover_source_dirs(&root_dir);
 
@@ -146,6 +154,7 @@ impl AppContext {
             source_dirs,
             target_dir,
             user,
+            dry_run,
         })
     }
 
@@ -165,19 +174,27 @@ async fn install(ctx: &AppContext) -> Result<()> {
         ctx.target_dir.display()
     );
 
-    fs::create_dir_all(&ctx.target_dir)
-        .await
-        .with_context(|| format!("failed to create {}", ctx.target_dir.display()))?;
+    if ctx.dry_run {
+        println!("DRY-RUN create {}", ctx.target_dir.display());
+    } else {
+        fs::create_dir_all(&ctx.target_dir)
+            .await
+            .with_context(|| format!("failed to create {}", ctx.target_dir.display()))?;
+    }
 
     let files = collect_quadlets(&ctx.source_dirs).await?;
     for src in files {
         let name = basename(&src)?;
         let dest = ctx.target_dir.join(&name);
-        link_or_replace(&src, &dest).await?;
+        if ctx.dry_run {
+            println!("DRY-RUN link {} -> {}", src.display(), dest.display());
+        } else {
+            link_or_replace(&src, &dest).await?;
+        }
         debug!("Linked {} -> {}", src.display(), dest.display());
     }
 
-    daemon_reload().await?;
+    daemon_reload(ctx).await?;
     debug!("Install complete");
     Ok(())
 }
@@ -200,33 +217,50 @@ async fn uninstall(ctx: &AppContext) -> Result<()> {
         }
 
         if ext == "container" {
-            let _ = systemctl_user("stop", &stem).await;
+            if ctx.dry_run {
+                println!("DRY-RUN systemctl --user stop {}", systemd_unit(&stem));
+            } else {
+                let _ = systemctl_user("stop", &stem).await;
+            }
             debug!("Stopped {stem} (if running)");
         }
 
-        fs::remove_file(&target)
-            .await
-            .with_context(|| format!("failed to remove {}", target.display()))?;
+        if ctx.dry_run {
+            println!("DRY-RUN remove {}", target.display());
+        } else {
+            fs::remove_file(&target)
+                .await
+                .with_context(|| format!("failed to remove {}", target.display()))?;
+        }
         debug!("Removed {}", target.display());
     }
 
-    daemon_reload().await?;
+    daemon_reload(ctx).await?;
     debug!("Uninstall complete");
     Ok(())
 }
 
 async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
     let targets = resolve_targets(ctx, service).await?;
-    ensure_targets_installed(ctx, &targets).await?;
+    if ctx.dry_run {
+        install_missing_targets(ctx, &targets).await?;
+    } else {
+        ensure_targets_installed(ctx, &targets).await?;
+    }
 
     for unit in targets {
+        if ctx.dry_run {
+            println!("DRY-RUN systemctl --user start {}", systemd_unit(&unit));
+            continue;
+        }
+
         let unit_file = ctx.target_dir.join(format!("{unit}.container"));
         if !path_exists(&unit_file).await? {
             debug!("Skipping {unit} (not linked in target dir)");
             continue;
         }
 
-        let _ = systemctl_user("start", &unit).await;
+        systemctl_user("start", &unit).await?;
         debug!("Started {unit}");
     }
 
@@ -234,6 +268,28 @@ async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
 }
 
 async fn ensure_targets_installed(ctx: &AppContext, targets: &[String]) -> Result<()> {
+    if missing_targets(ctx, targets).await?.is_empty() {
+        return Ok(());
+    }
+
+    debug!("Missing links. Installing quadlets first.");
+    install(ctx).await
+}
+
+async fn install_missing_targets(ctx: &AppContext, targets: &[String]) -> Result<()> {
+    let missing_targets = missing_targets(ctx, targets).await?;
+    if missing_targets.is_empty() {
+        return Ok(());
+    }
+
+    println!(
+        "DRY-RUN install missing target links for {}",
+        missing_targets.join(", ")
+    );
+    install(ctx).await
+}
+
+async fn missing_targets(ctx: &AppContext, targets: &[String]) -> Result<Vec<String>> {
     let mut missing_targets = Vec::new();
 
     for unit in targets {
@@ -243,27 +299,24 @@ async fn ensure_targets_installed(ctx: &AppContext, targets: &[String]) -> Resul
         }
     }
 
-    if missing_targets.is_empty() {
-        return Ok(());
-    }
-
-    debug!(
-        "Missing links for {}. Installing quadlets first.",
-        missing_targets.join(", ")
-    );
-    install(ctx).await
+    Ok(missing_targets)
 }
 
 async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
     let targets = resolve_targets(ctx, service).await?;
     for unit in targets {
+        if ctx.dry_run {
+            println!("DRY-RUN systemctl --user stop {}", systemd_unit(&unit));
+            continue;
+        }
+
         let unit_file = ctx.target_dir.join(format!("{unit}.container"));
         if !path_exists(&unit_file).await? {
             debug!("Skipping {unit} (not linked in target dir)");
             continue;
         }
 
-        let _ = systemctl_user("stop", &unit).await;
+        systemctl_user("stop", &unit).await?;
         debug!("Stopped {unit}");
     }
 
@@ -273,13 +326,18 @@ async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
 async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
     let targets = resolve_targets(ctx, service).await?;
     for unit in targets {
+        if ctx.dry_run {
+            println!("DRY-RUN systemctl --user restart {}", systemd_unit(&unit));
+            continue;
+        }
+
         let unit_file = ctx.target_dir.join(format!("{unit}.container"));
         if !path_exists(&unit_file).await? {
             debug!("Skipping {unit} (not linked in target dir)");
             continue;
         }
 
-        let _ = systemctl_user("restart", &unit).await;
+        systemctl_user("restart", &unit).await?;
         debug!("Restarted {unit}");
     }
 
@@ -316,7 +374,7 @@ async fn status(ctx: &AppContext, service: Option<String>, compact: bool) -> Res
     for (index, unit) in targets.iter().enumerate() {
         let linked = path_exists(&ctx.target_dir.join(format!("{unit}.container"))).await?;
         let running = if linked {
-            is_active(&unit).await.unwrap_or(false)
+            is_active(unit).await.unwrap_or(false)
         } else {
             false
         };
@@ -363,10 +421,11 @@ async fn status(ctx: &AppContext, service: Option<String>, compact: bool) -> Res
         }
     }
 
-    if !compact {
-        println!("{table}");
+    if compact {
+        return Ok(());
     }
 
+    println!("{table}");
     println!();
     println!("Summary:");
     println!("  total   = {} (container units found)", targets.len());
@@ -547,10 +606,12 @@ fn wait_for_enter() -> Result<()> {
     Ok(())
 }
 
-async fn clean_volumes(ctx: &AppContext) -> Result<()> {
+async fn clean_volumes(ctx: &AppContext, yes: bool) -> Result<()> {
     debug!("Removing podman volumes declared in .volume files");
 
     let files = collect_quadlets(&ctx.source_dirs).await?;
+    let mut volume_names = Vec::new();
+
     for path in files {
         if extension_of_path(&path) != Some("volume") {
             continue;
@@ -565,11 +626,48 @@ async fn clean_volumes(ctx: &AppContext) -> Result<()> {
             continue;
         };
 
-        let _ = run_command("podman", &["volume", "rm", "-f", &volume_name], true).await;
+        volume_names.push(volume_name);
+    }
+
+    if volume_names.is_empty() {
+        println!("No podman volumes declared in .volume files");
+        return Ok(());
+    }
+
+    if ctx.dry_run {
+        for volume_name in volume_names {
+            println!("DRY-RUN podman volume rm -f {volume_name}");
+        }
+        return Ok(());
+    }
+
+    if !yes && !confirm_clean_volumes(&volume_names)? {
+        println!("Aborted");
+        return Ok(());
+    }
+
+    for volume_name in volume_names {
+        run_command("podman", &["volume", "rm", "-f", &volume_name], false).await?;
         debug!("Removed volume: {volume_name}");
     }
 
     Ok(())
+}
+
+fn confirm_clean_volumes(volume_names: &[String]) -> Result<bool> {
+    println!("This will remove {} podman volume(s):", volume_names.len());
+    for volume_name in volume_names {
+        println!("  {volume_name}");
+    }
+    print!("Continue? [y/N]: ");
+    io::stdout().flush().context("failed to flush stdout")?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read confirmation")?;
+
+    Ok(matches!(input.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
 async fn check_quadlet(ctx: &AppContext, quadlet: String) -> Result<()> {
@@ -586,12 +684,11 @@ async fn check_quadlet(ctx: &AppContext, quadlet: String) -> Result<()> {
 async fn logs(service: String, extra: bool) -> Result<()> {
     let unit = systemd_unit(&service);
     if extra {
-        run_command("journalctl", &["--user", "-xsfu", &unit], false).await?;
+        run_command_streaming("journalctl", &["--user", "-xsfu", &unit]).await?;
     } else {
-        run_command(
+        run_command_streaming(
             "journalctl",
             &["--user", "-u", &unit, "-f", "--since", "1 hour ago"],
-            false,
         )
         .await?;
     }
@@ -644,7 +741,7 @@ async fn resolve_targets(ctx: &AppContext, service: Option<String>) -> Result<Ve
     }
 
     if path_exists(&ctx.target_dir).await? {
-        let installed_files = collect_quadlets(&[ctx.target_dir.clone()]).await?;
+        let installed_files = collect_quadlets(std::slice::from_ref(&ctx.target_dir)).await?;
         for path in installed_files {
             if extension_of_path(&path) == Some("container") {
                 out.push(strip_dot_extension(&basename(&path)?));
@@ -742,7 +839,10 @@ fn extension_of_path(path: &Path) -> Option<&str> {
 }
 
 fn strip_dot_extension(name: &str) -> String {
-    name.split('.').next().unwrap_or(name).to_string()
+    name.rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(name)
+        .to_string()
 }
 
 fn parse_volume_name(content: &str) -> Option<String> {
@@ -753,7 +853,12 @@ fn parse_volume_name(content: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-async fn daemon_reload() -> Result<()> {
+async fn daemon_reload(ctx: &AppContext) -> Result<()> {
+    if ctx.dry_run {
+        println!("DRY-RUN systemctl --user daemon-reload");
+        return Ok(());
+    }
+
     run_command("systemctl", &["--user", "daemon-reload"], false).await
 }
 
@@ -769,7 +874,7 @@ async fn is_active(unit: &str) -> Result<bool> {
 
 async fn systemctl_user(action: &str, unit: &str) -> Result<()> {
     let unit = systemd_unit(unit);
-    run_command("systemctl", &["--user", action, &unit], true).await
+    run_command("systemctl", &["--user", action, &unit], false).await
 }
 
 fn systemd_unit(unit: &str) -> String {
@@ -783,20 +888,136 @@ fn systemd_unit(unit: &str) -> String {
 async fn run_command(cmd: &str, args: &[&str], allow_failure: bool) -> Result<()> {
     debug!("Running command: {} {}", cmd, args.join(" "));
 
-    let mut command = Command::new(cmd);
-    command.args(args);
     if allow_failure {
-        command.stderr(Stdio::null());
+        let status = Command::new(cmd)
+            .args(args)
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .with_context(|| format!("failed to execute {cmd}"))?;
+
+        if !status.success() {
+            debug!("Allowed command failure: {}", format_command(cmd, args));
+        }
+
+        return Ok(());
     }
 
-    let status = command
+    let output = Command::new(cmd)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("failed to execute {cmd}"))?;
+
+    if !output.stdout.is_empty() {
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    if !output.status.success() {
+        return Err(command_error(cmd, args, output.status, &output.stderr));
+    }
+
+    Ok(())
+}
+
+async fn run_command_streaming(cmd: &str, args: &[&str]) -> Result<()> {
+    debug!("Running command: {} {}", cmd, args.join(" "));
+
+    let status = Command::new(cmd)
+        .args(args)
         .status()
         .await
         .with_context(|| format!("failed to execute {cmd}"))?;
 
-    if !status.success() && !allow_failure {
-        return Err(anyhow!("command failed: {} {}", cmd, args.join(" ")));
+    if !status.success() {
+        return Err(anyhow!(
+            "command failed: {} (exit status: {})",
+            format_command(cmd, args),
+            exit_status_display(status)
+        ));
     }
 
     Ok(())
+}
+
+fn command_error(cmd: &str, args: &[&str], status: ExitStatus, stderr: &[u8]) -> anyhow::Error {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    if stderr.is_empty() {
+        anyhow!(
+            "command failed: {} (exit status: {})",
+            format_command(cmd, args),
+            exit_status_display(status)
+        )
+    } else {
+        anyhow!(
+            "command failed: {} (exit status: {})\nstderr:\n{}",
+            format_command(cmd, args),
+            exit_status_display(status),
+            stderr
+        )
+    }
+}
+
+fn format_command(cmd: &str, args: &[&str]) -> String {
+    if args.is_empty() {
+        cmd.to_string()
+    } else {
+        format!("{} {}", cmd, args.join(" "))
+    }
+}
+
+fn exit_status_display(status: ExitStatus) -> String {
+    status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "terminated by signal".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_dot_extension_removes_only_the_last_extension() {
+        assert_eq!(strip_dot_extension("voicebox.container"), "voicebox");
+        assert_eq!(strip_dot_extension("voicebox"), "voicebox");
+        assert_eq!(
+            strip_dot_extension("voicebox.prod.container"),
+            "voicebox.prod"
+        );
+    }
+
+    #[test]
+    fn systemd_unit_adds_service_suffix_only_for_plain_names() {
+        assert_eq!(systemd_unit("voicebox"), "voicebox.service");
+        assert_eq!(systemd_unit("voicebox.service"), "voicebox.service");
+        assert_eq!(systemd_unit("voicebox.container"), "voicebox.container");
+    }
+
+    #[test]
+    fn parse_volume_name_reads_non_empty_volume_name() {
+        let content = "[Volume]\nVolumeName=voicebox-data\n";
+        assert_eq!(parse_volume_name(content).as_deref(), Some("voicebox-data"));
+    }
+
+    #[test]
+    fn parse_volume_name_ignores_missing_or_empty_names() {
+        assert_eq!(parse_volume_name("[Volume]\n"), None);
+        assert_eq!(parse_volume_name("VolumeName=\n"), None);
+        assert_eq!(parse_volume_name("VolumeName=   \n"), None);
+    }
+
+    #[test]
+    fn parse_menu_selection_accepts_number_first_or_action_first() {
+        assert_eq!(parse_menu_selection(&["2"]).unwrap(), (2, None));
+        assert_eq!(parse_menu_selection(&["2", "r"]).unwrap(), (2, Some("r")));
+        assert_eq!(
+            parse_menu_selection(&["restart", "3"]).unwrap(),
+            (3, Some("restart"))
+        );
+        assert!(parse_menu_selection(&["restart"]).is_err());
+    }
 }
