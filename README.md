@@ -64,6 +64,7 @@ O usando binario compilado:
 ```text
 qctl install
 qctl uninstall
+qctl reinstall
 qctl start [SERVICE]
 qctl stop [SERVICE]
 qctl restart [SERVICE]

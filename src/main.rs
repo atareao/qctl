@@ -33,6 +33,8 @@ enum Commands {
     Install,
     /// Stop services, remove symlinks and reload user systemd
     Uninstall,
+    /// Uninstall and then install again (stops services, recreates symlinks)
+    Reinstall,
     /// Start all container units or one specific service
     Start {
         /// Service name, with or without .container extension
@@ -113,6 +115,10 @@ async fn main() -> Result<()> {
         }
         Commands::Uninstall => {
             uninstall(&ctx).await?;
+            status(&ctx, None, false).await?;
+        }
+        Commands::Reinstall => {
+            reinstall(&ctx).await?;
             status(&ctx, None, false).await?;
         }
         Commands::Start { service } => {
@@ -218,6 +224,14 @@ async fn uninstall(ctx: &AppContext) -> Result<()> {
 
     daemon_reload().await?;
     debug!("Uninstall complete");
+    Ok(())
+}
+
+async fn reinstall(ctx: &AppContext) -> Result<()> {
+    debug!("Reinstalling quadlets");
+    uninstall(ctx).await?;
+    install(ctx).await?;
+    debug!("Reinstall complete");
     Ok(())
 }
 
