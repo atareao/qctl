@@ -246,6 +246,7 @@ async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
             continue;
         }
 
+        println!("Starting {unit}");
         let _ = systemctl_user("start", &unit).await;
         debug!("Started {unit}");
     }
