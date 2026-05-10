@@ -50,6 +50,11 @@ enum Commands {
         /// Service name, with or without .container extension
         service: Option<String>,
     },
+    /// Pull latest container images
+    Update {
+        /// Service name, with or without .container extension
+        service: Option<String>,
+    },
     /// Show status for all container units or one specific service
     Status {
         /// Service name, with or without .container extension
@@ -133,6 +138,7 @@ async fn main() -> Result<()> {
             restart(&ctx, service.clone()).await?;
             status(&ctx, service, false).await?;
         }
+        Commands::Update { service } => update(&ctx, service).await?,
         Commands::Status { service, compact } => status(&ctx, service, compact).await?,
         Commands::CleanVolumes => clean_volumes(&ctx).await?,
         Commands::Check { quadlet } => check_quadlet(&ctx, quadlet).await?,
@@ -302,6 +308,66 @@ async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
 
         let _ = systemctl_user("restart", &unit).await;
         debug!("Restarted {unit}");
+    }
+
+    Ok(())
+}
+
+async fn update(ctx: &AppContext, service: Option<String>) -> Result<()> {
+    let files = collect_quadlets(&ctx.source_dirs).await?;
+    let containers: Vec<_> = files
+        .into_iter()
+        .filter(|path| extension_of_path(path) == Some("container"))
+        .collect();
+
+    let mut pulled = 0;
+    let mut failed = 0;
+
+    for path in &containers {
+        let unit = strip_dot_extension(&basename(path)?);
+
+        if let Some(ref svc) = service {
+            if unit != strip_dot_extension(svc) {
+                continue;
+            }
+        }
+
+        let content = fs::read_to_string(path)
+            .await
+            .with_context(|| format!("failed to read {}", path.display()))?;
+
+        let Some(image) = parse_image_name(&content) else {
+            println!("Skipping {unit} (no Image= found)");
+            continue;
+        };
+
+        println!("Pulling {unit}: {image}");
+        let status = Command::new("podman")
+            .args(["pull", &image])
+            .status()
+            .await;
+
+        match status {
+            Ok(s) if s.success() => {
+                println!("Updated {unit}");
+                pulled += 1;
+            }
+            _ => {
+                eprintln!("Failed to pull image for {unit}");
+                failed += 1;
+            }
+        }
+    }
+
+    if pulled == 0 && failed == 0 {
+        if let Some(ref svc) = service {
+            println!("Container '{svc}' not found in {}", ctx.source_display());
+        } else {
+            println!("No container quadlets found in {}", ctx.source_display());
+        }
+    } else {
+        println!();
+        println!("Summary: {pulled} updated, {failed} failed");
     }
 
     Ok(())
@@ -581,6 +647,14 @@ fn parse_volume_name(content: &str) -> Option<String> {
     content
         .lines()
         .find_map(|line| line.strip_prefix("VolumeName="))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn parse_image_name(content: &str) -> Option<String> {
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix("Image="))
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
 }

@@ -10,6 +10,7 @@ CLI en Rust para gestionar quadlets de forma simple y segura: instalación de en
 ## Características
 
 - Instala y desinstala quadlets encontrados en `./quadlets/` o en el directorio actual.
+- Actualiza las imágenes de los contenedores con `podman pull` leyendo el campo `Image=` de cada `.container`.
 - Inicia y detiene servicios de contenedor con `systemctl --user`.
 - Si ejecutas `qctl start` sin haber instalado antes, instala los quadlets necesarios y luego arranca el servicio.
 - Muestra estado en formato visual (tabla) o compacto (ideal para scripts).
@@ -68,6 +69,7 @@ qctl reinstall
 qctl start [SERVICE]
 qctl stop [SERVICE]
 qctl restart [SERVICE]
+qctl update [SERVICE]
 qctl status [SERVICE] [--compact]
 qctl clean-volumes
 qctl check <QUADLET>
@@ -85,6 +87,8 @@ cargo run -- status
 cargo run -- status --compact
 cargo run -- stop voicebox
 cargo run -- restart voicebox
+cargo run -- update
+cargo run -- update voicebox
 cargo run -- clean-volumes
 cargo run -- check quadlets/voicebox.container
 cargo run -- logs voicebox
