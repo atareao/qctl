@@ -75,11 +75,8 @@ enum Commands {
         /// Systemd user unit name
         service: String,
     },
-    /// Show logs in follow mode with extra metadata
-    Logsf {
-        /// Systemd user unit name
-        service: String,
-    },
+    /// Reload systemd user daemon
+    Reload,
     /// Generate shell completions
     #[command(hide = true)]
     Completions {
@@ -144,6 +141,7 @@ async fn main() -> Result<()> {
         Commands::Check { quadlet } => check_quadlet(&ctx, quadlet).await?,
         Commands::Logs { service } => logs(service, false).await?,
         Commands::Logsf { service } => logs(service, true).await?,
+        Commands::Reload => daemon_reload().await?,
         Commands::Completions { .. } => unreachable!(),
     }
 
