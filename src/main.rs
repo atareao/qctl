@@ -140,7 +140,6 @@ async fn main() -> Result<()> {
         Commands::CleanVolumes => clean_volumes(&ctx).await?,
         Commands::Check { quadlet } => check_quadlet(&ctx, quadlet).await?,
         Commands::Logs { service } => logs(service, false).await?,
-        Commands::Logsf { service } => logs(service, true).await?,
         Commands::Reload => daemon_reload().await?,
         Commands::Completions { .. } => unreachable!(),
     }
