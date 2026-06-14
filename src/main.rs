@@ -242,6 +242,7 @@ async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
     let targets = resolve_targets(&ctx.source_dirs, service).await?;
     ensure_targets_installed(ctx, &targets).await?;
 
+    let mut handles = Vec::new();
     for unit in targets {
         let unit_file = ctx.target_dir.join(format!("{unit}.container"));
         if !path_exists(&unit_file).await? {
@@ -250,8 +251,14 @@ async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
         }
 
         println!("Starting {unit}");
-        let _ = systemctl_user("start", &unit).await;
-        debug!("Started {unit}");
+        handles.push(tokio::spawn(async move {
+            let _ = systemctl_user("start", &unit).await;
+            debug!("Started {unit}");
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.await;
     }
 
     Ok(())
@@ -280,6 +287,7 @@ async fn ensure_targets_installed(ctx: &AppContext, targets: &[String]) -> Resul
 
 async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
     let targets = resolve_targets(&ctx.source_dirs, service).await?;
+    let mut handles = Vec::new();
     for unit in targets {
         let unit_file = ctx.target_dir.join(format!("{unit}.container"));
         if !path_exists(&unit_file).await? {
@@ -287,8 +295,14 @@ async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
             continue;
         }
 
-        let _ = systemctl_user("stop", &unit).await;
-        debug!("Stopped {unit}");
+        handles.push(tokio::spawn(async move {
+            let _ = systemctl_user("stop", &unit).await;
+            debug!("Stopped {unit}");
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.await;
     }
 
     Ok(())
@@ -296,6 +310,7 @@ async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
 
 async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
     let targets = resolve_targets(&ctx.source_dirs, service).await?;
+    let mut handles = Vec::new();
     for unit in targets {
         let unit_file = ctx.target_dir.join(format!("{unit}.container"));
         if !path_exists(&unit_file).await? {
@@ -303,8 +318,14 @@ async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
             continue;
         }
 
-        let _ = systemctl_user("restart", &unit).await;
-        debug!("Restarted {unit}");
+        handles.push(tokio::spawn(async move {
+            let _ = systemctl_user("restart", &unit).await;
+            debug!("Restarted {unit}");
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.await;
     }
 
     Ok(())
