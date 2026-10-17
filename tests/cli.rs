@@ -42,6 +42,7 @@ fn run_qctl(home: &Path, cwd: &Path, args: &[&str]) -> Output {
         .current_dir(cwd)
         .env("HOME", home)
         .env("USER", "qctl-test")
+        .env_remove("RUST_LOG")
         .output()
         .expect("failed to run qctl")
 }
@@ -52,6 +53,7 @@ fn run_qctl_with_stdin(home: &Path, cwd: &Path, args: &[&str], stdin: &str) -> O
         .current_dir(cwd)
         .env("HOME", home)
         .env("USER", "qctl-test")
+        .env_remove("RUST_LOG")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -74,6 +76,7 @@ fn run_qctl_with_path(home: &Path, cwd: &Path, path: &Path, args: &[&str]) -> Ou
         .current_dir(cwd)
         .env("HOME", home)
         .env("USER", "qctl-test")
+        .env_remove("RUST_LOG")
         .env("PATH", path)
         .output()
         .expect("failed to run qctl")
@@ -148,6 +151,7 @@ fn install_creates_symlink_and_reload_with_fake_systemctl() {
         .current_dir(&project)
         .env("HOME", &home)
         .env("USER", "qctl-test")
+        .env_remove("RUST_LOG")
         .env("PATH", prepend_path(&bin))
         .output()
         .expect("failed to run qctl");
@@ -189,6 +193,7 @@ fn uninstall_removes_symlink_and_stops_container_unit() {
         .current_dir(&project)
         .env("HOME", &home)
         .env("USER", "qctl-test")
+        .env_remove("RUST_LOG")
         .env("PATH", prepend_path(&bin))
         .output()
         .expect("failed to run qctl");
@@ -222,6 +227,7 @@ fn start_stop_restart_call_expected_systemctl_units() {
             .current_dir(&project)
             .env("HOME", &home)
             .env("USER", "qctl-test")
+            .env_remove("RUST_LOG")
             .env("PATH", prepend_path(&bin))
             .output()
             .expect("failed to run qctl");
