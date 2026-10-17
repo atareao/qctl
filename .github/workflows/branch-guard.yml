@@ -1,0 +1,30 @@
+name: Branch guard
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check-source-branch:
+    name: Check source branch
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Validate source branch against gitflow
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          echo "PR desde '$HEAD_REF' hacia 'main'"
+          case "$HEAD_REF" in
+            develop|release/*|hotfix/*)
+              echo "✅ Origen válido según gitflow."
+              ;;
+            *)
+              echo "::error::Los PRs hacia main solo pueden venir de develop, release/* o hotfix/* (gitflow). Origen: $HEAD_REF"
+              exit 1
+              ;;
+          esac
