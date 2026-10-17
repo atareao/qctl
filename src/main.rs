@@ -591,9 +591,14 @@ async fn menu(ctx: &AppContext, service: Option<String>) -> Result<()> {
         io::stdout().flush().context("failed to flush stdout")?;
 
         let mut input = String::new();
-        io::stdin()
+        let bytes = io::stdin()
             .read_line(&mut input)
             .context("failed to read selection")?;
+        if bytes == 0 {
+            // EOF on stdin (for example a closed pipe or /dev/null): end the
+            // menu cleanly instead of redrawing it forever.
+            break;
+        }
         let input = input.trim();
         if input.is_empty() {
             continue;
@@ -603,7 +608,14 @@ async fn menu(ctx: &AppContext, service: Option<String>) -> Result<()> {
         }
 
         let parts = input.split_whitespace().collect::<Vec<_>>();
-        let (index, action) = parse_menu_selection(&parts)?;
+        let (index, action) = match parse_menu_selection(&parts) {
+            Ok(selection) => selection,
+            Err(err) => {
+                println!("Invalid selection: {err}");
+                wait_for_enter()?;
+                continue;
+            }
+        };
         let Some(row) = rows.get(index.saturating_sub(1)) else {
             println!("Invalid selection: {index}");
             wait_for_enter()?;
@@ -611,23 +623,28 @@ async fn menu(ctx: &AppContext, service: Option<String>) -> Result<()> {
         };
 
         let action = action.unwrap_or(if row.running { "p" } else { "s" });
-        match action {
-            "s" | "start" => start(ctx, Some(row.unit.clone())).await?,
-            "p" | "stop" => stop(ctx, Some(row.unit.clone())).await?,
-            "r" | "restart" => restart(ctx, Some(row.unit.clone())).await?,
+        let result = match action {
+            "s" | "start" => start(ctx, Some(row.unit.clone())).await,
+            "p" | "stop" => stop(ctx, Some(row.unit.clone())).await,
+            "r" | "restart" => restart(ctx, Some(row.unit.clone())).await,
             "l" | "logs" => {
                 print!("\x1B[2J\x1B[H");
                 println!("Recent logs for {}", row.unit);
                 println!();
-                recent_logs(&row.unit).await?;
-                println!();
-                wait_for_enter()?;
+                recent_logs(&row.unit).await
             }
             other => {
                 println!("Unknown action: {other}");
                 wait_for_enter()?;
                 continue;
             }
+        };
+
+        if let Err(err) = result {
+            // A failing action must not tear down the whole menu: report it and
+            // return to the prompt.
+            println!("Action failed: {err:#}");
+            wait_for_enter()?;
         }
     }
 
@@ -713,22 +730,36 @@ fn parse_menu_selection<'a>(parts: &[&'a str]) -> Result<(usize, Option<&'a str>
     }
 
     if let Ok(index) = parts[0].parse::<usize>() {
+        validate_menu_index(index)?;
         return Ok((index, parts.get(1).copied()));
     }
 
     let Some(index) = parts.get(1).and_then(|value| value.parse::<usize>().ok()) else {
         return Err(anyhow!("use: <number> [action] or <action> <number>"));
     };
+    validate_menu_index(index)?;
     Ok((index, Some(parts[0])))
+}
+
+fn validate_menu_index(index: usize) -> Result<()> {
+    if index == 0 {
+        return Err(anyhow!("selection must be a positive row number"));
+    }
+    Ok(())
 }
 
 fn wait_for_enter() -> Result<()> {
     print!("Press Enter to continue...");
     io::stdout().flush().context("failed to flush stdout")?;
     let mut input = String::new();
-    io::stdin()
+    let bytes = io::stdin()
         .read_line(&mut input)
         .context("failed to wait for enter")?;
+    if bytes == 0 {
+        // EOF: there is nobody to press Enter, so stop waiting instead of
+        // spinning on an empty read.
+        return Ok(());
+    }
     Ok(())
 }
 
@@ -1153,5 +1184,12 @@ mod tests {
             (3, Some("restart"))
         );
         assert!(parse_menu_selection(&["restart"]).is_err());
+    }
+
+    #[test]
+    fn parse_menu_selection_rejects_zero_index() {
+        assert!(parse_menu_selection(&["0"]).is_err());
+        assert!(parse_menu_selection(&["0", "r"]).is_err());
+        assert!(parse_menu_selection(&["r", "0"]).is_err());
     }
 }

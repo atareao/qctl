@@ -3,8 +3,8 @@ use std::io::Write;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct TestDir {
     path: PathBuf,
@@ -68,6 +68,55 @@ fn run_qctl_with_stdin(home: &Path, cwd: &Path, args: &[&str], stdin: &str) -> O
         .expect("failed to write stdin");
 
     child.wait_with_output().expect("failed to wait for qctl")
+}
+
+/// Runs qctl with stdin closed (immediately at EOF) and fails the test if the
+/// process does not exit within `timeout`, killing it first so the suite never
+/// hangs. Returns `None` on timeout.
+fn run_qctl_with_closed_stdin(
+    home: &Path,
+    cwd: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<Output> {
+    let child = Command::new(env!("CARGO_BIN_EXE_qctl"))
+        .args(args)
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("USER", "qctl-test")
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn qctl");
+
+    wait_with_timeout(child, timeout)
+}
+
+fn wait_with_timeout(mut child: Child, timeout: Duration) -> Option<Output> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child
+            .try_wait()
+            .expect("failed to poll qctl process")
+            .is_some()
+        {
+            return Some(
+                child
+                    .wait_with_output()
+                    .expect("failed to collect qctl output"),
+            );
+        }
+
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn run_qctl_with_path(home: &Path, cwd: &Path, path: &Path, args: &[&str]) -> Output {
@@ -440,5 +489,29 @@ fn logs_uses_plain_journalctl_flags() {
     assert!(
         logged.contains("--user -u voicebox.service -f --since 1 hour ago"),
         "logs must pass plain flags: {logged}"
+    );
+}
+
+#[test]
+fn menu_exits_on_eof_without_looping() {
+    let root = TestDir::new("menu-eof");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&home).expect("failed to create home");
+    write_file(
+        &project.join("voicebox.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let output = run_qctl_with_closed_stdin(&home, &project, &["menu"], Duration::from_secs(10))
+        .expect("menu did not exit on EOF");
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.len() < 10_000,
+        "menu must not spin on EOF, produced {} bytes",
+        stdout.len()
     );
 }
