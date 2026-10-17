@@ -165,16 +165,16 @@ fn fake_journalctl(bin: &Path, log: &Path) {
         .expect("failed to chmod fake journalctl");
 }
 
-/// A fake `systemctl` that fails for `failbox.service` and, for `okbox.service`,
-/// writes `START` then sleeps then writes `END` so tests can prove qctl waited
-/// for every unit before reporting.
+/// A fake `systemctl` that fails for `failbox.service` and `failbox2.service`
+/// and, for `okbox.service`, writes `START` then sleeps then writes `END` so
+/// tests can prove qctl waited for every unit before reporting.
 fn fake_failing_start_systemctl(bin: &Path, log: &Path) {
     let script = format!(
         r#"#!/bin/sh
 echo "$@" >> {log}
 if [ "$2" = "start" ]; then
-  if [ "$3" = "failbox.service" ]; then
-    echo "failbox exploded" >&2
+  if [ "$3" = "failbox.service" ] || [ "$3" = "failbox2.service" ]; then
+    echo "start failed for $3" >&2
     exit 1
   fi
   if [ "$3" = "okbox.service" ]; then
@@ -468,8 +468,9 @@ fn dry_run_update_does_not_call_podman() {
         stdout.contains("DRY-RUN summary: 1 would be pulled"),
         "dry-run summary must not claim updates: {stdout}"
     );
+    // Any casing of the verb would mean `update` reported real work in dry-run.
     assert!(
-        !stdout.contains("updated"),
+        !stdout.to_lowercase().contains("updated"),
         "dry-run must not report updates: {stdout}"
     );
 
@@ -567,7 +568,7 @@ fn start_reports_all_unit_failures() {
     fs::create_dir_all(&target).expect("failed to create target");
     fs::create_dir_all(&bin).expect("failed to create bin");
     fake_failing_start_systemctl(&bin, &log);
-    for name in ["failbox", "okbox"] {
+    for name in ["failbox", "failbox2", "okbox"] {
         let source = project.join(format!("{name}.container"));
         write_file(&source, "[Container]\nImage=example\n");
         symlink(&source, target.join(format!("{name}.container")))
@@ -591,10 +592,28 @@ fn start_reports_all_unit_failures() {
     assert!(!output.status.success(), "start must fail: {output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("failbox"),
-        "stderr must name the failing unit: {stderr}"
+        stderr.contains("failed for 2 unit(s)"),
+        "aggregated error must count both failures: {stderr}"
     );
 
+    // Assert on the aggregated report itself, not merely on the unit names
+    // appearing anywhere in stderr: the child stderr is forwarded too, so a
+    // bare `contains("failbox")` would pass even if failures were dropped.
+    let aggregated = stderr
+        .split_once("failed for 2 unit(s):")
+        .map(|(_, rest)| rest)
+        .expect("aggregated failure block missing");
+    for unit in ["failbox", "failbox2"] {
+        assert!(
+            aggregated
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("{unit}:"))),
+            "aggregated error must carry a context line for {unit}: {aggregated}"
+        );
+    }
+
+    // The healthy unit must have run to completion, proving every task was
+    // awaited instead of bailing out on the first failure.
     let logged = fs::read_to_string(&log).expect("missing systemctl log");
     assert!(
         logged.contains("END okbox.service"),
