@@ -214,10 +214,17 @@ async fn install(ctx: &AppContext) -> Result<()> {
             .with_context(|| format!("failed to create {}", ctx.target_dir.display()))?;
     }
 
+    let target_canon = fs::canonicalize(&ctx.target_dir).await.ok();
     let files = collect_quadlets(&ctx.source_dirs).await?;
     for src in files {
         let name = basename(&src)?;
         let dest = ctx.target_dir.join(&name);
+
+        if source_is_in_target_dir(&src, target_canon.as_deref()).await? {
+            println!("Skipping {name} (already in target dir)");
+            continue;
+        }
+
         if ctx.dry_run {
             println!("DRY-RUN link {} -> {}", src.display(), dest.display());
         } else {
@@ -229,6 +236,19 @@ async fn install(ctx: &AppContext) -> Result<()> {
     daemon_reload(ctx).await?;
     debug!("Install complete");
     Ok(())
+}
+
+/// Returns true when `src` already lives inside the target directory, comparing
+/// canonical paths rather than string prefixes so symlinked directories and
+/// `..` segments do not fool the check.
+async fn source_is_in_target_dir(src: &Path, target_canon: Option<&Path>) -> Result<bool> {
+    let Some(target_canon) = target_canon else {
+        return Ok(false);
+    };
+
+    let parent = src.parent().unwrap_or_else(|| Path::new("."));
+    let parent_canon = fs::canonicalize(parent).await.ok();
+    Ok(parent_canon.as_deref() == Some(target_canon))
 }
 
 async fn uninstall(ctx: &AppContext) -> Result<()> {

@@ -742,3 +742,44 @@ fn dry_run_uninstall_does_not_stop_or_remove() {
         "daemon-reload must not run in dry-run: {logged}"
     );
 }
+
+#[test]
+fn install_skips_quadlets_already_in_target_dir() {
+    let root = TestDir::new("install-target-dir");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    let source = target.join("voicebox.container");
+    write_file(&source, "[Container]\nImage=example\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_qctl"))
+        .arg("install")
+        .current_dir(&target)
+        .env("HOME", &home)
+        .env("USER", "qctl-test")
+        .env_remove("RUST_LOG")
+        .env("PATH", prepend_path(&bin))
+        .output()
+        .expect("failed to run qctl");
+    assert!(output.status.success(), "{output:?}");
+
+    let metadata = fs::symlink_metadata(&source).expect("quadlet should still exist");
+    assert!(
+        metadata.file_type().is_file(),
+        "quadlet must stay a regular file, not a self-referential symlink"
+    );
+    assert_eq!(
+        fs::read_to_string(&source).expect("failed to read quadlet"),
+        "[Container]\nImage=example\n"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Skipping voicebox.container (already in target dir)"),
+        "{stdout}"
+    );
+}
