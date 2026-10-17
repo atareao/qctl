@@ -244,14 +244,18 @@ async fn install(ctx: &AppContext) -> Result<()> {
 /// Returns true when `src` already lives inside the target directory, comparing
 /// canonical paths rather than string prefixes so symlinked directories and
 /// `..` segments do not fool the check.
-async fn source_is_in_target_dir(src: &Path, target_canon: Option<&Path>) -> Result<bool> {
+///
+/// A failed `canonicalize` (for example a path that vanished mid-scan) yields
+/// `false`: the source is then treated as external and linked normally, which is
+/// the safe default and needs no error path at the call site.
+async fn source_is_in_target_dir(src: &Path, target_canon: Option<&Path>) -> bool {
     let Some(target_canon) = target_canon else {
-        return Ok(false);
+        return false;
     };
 
     let parent = src.parent().unwrap_or_else(|| Path::new("."));
     let parent_canon = fs::canonicalize(parent).await.ok();
-    Ok(parent_canon.as_deref() == Some(target_canon))
+    parent_canon.as_deref() == Some(target_canon)
 }
 
 async fn uninstall(ctx: &AppContext) -> Result<()> {
