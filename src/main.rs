@@ -418,7 +418,7 @@ async fn status(ctx: &AppContext, service: Option<String>, compact: bool) -> Res
     for (index, unit) in targets.iter().enumerate() {
         let linked = path_exists(&ctx.target_dir.join(format!("{unit}.container"))).await?;
         let running = if linked {
-            is_active(&unit).await.unwrap_or(false)
+            is_active(unit).await.unwrap_or(false)
         } else {
             false
         };
