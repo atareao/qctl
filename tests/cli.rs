@@ -197,6 +197,20 @@ exit 0
 }
 
 #[test]
+fn version_flag_reports_crate_version() {
+    let root = TestDir::new("version");
+    let output = run_qctl(root.path(), root.path(), &["--version"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "expected version {} in stdout: {stdout}",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+#[test]
 fn dry_run_install_reports_actions_without_touching_home() {
     let root = TestDir::new("dry-run-install");
     let project = root.path().join("project");
