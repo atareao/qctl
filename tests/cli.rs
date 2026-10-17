@@ -294,6 +294,65 @@ fn uninstall_removes_symlink_and_stops_container_unit() {
 }
 
 #[test]
+fn uninstall_stop_warning_goes_to_stderr() {
+    let root = TestDir::new("uninstall-warn");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    let target = home.join(".config").join("containers").join("systemd");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+
+    let script = format!(
+        r#"#!/bin/sh
+echo "$@" >> {log}
+if [ "$2" = "stop" ]; then
+  echo "Unit voicebox.service not loaded." >&2
+  exit 5
+fi
+exit 0
+"#,
+        log = log.display()
+    );
+    let systemctl = bin.join("systemctl");
+    write_file(&systemctl, &script);
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755))
+        .expect("failed to chmod fake systemctl");
+
+    let source = project.join("voicebox.container");
+    let link = target.join("voicebox.container");
+    write_file(&source, "[Container]\nImage=example\n");
+    symlink(&source, &link).expect("failed to create test symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_qctl"))
+        .arg("uninstall")
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("USER", "qctl-test")
+        .env_remove("RUST_LOG")
+        .env("PATH", prepend_path(&bin))
+        .output()
+        .expect("failed to run qctl");
+    assert!(output.status.success(), "{output:?}");
+
+    // A stop failure is a diagnostic: it must be readable when only stderr is
+    // redirected, and must not pollute the stdout a script parses.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to stop voicebox"),
+        "stop warning must reach stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("failed to stop voicebox"),
+        "stop warning must not go to stdout: {stdout}"
+    );
+    assert!(!link.exists(), "uninstall must still remove the link");
+}
+
+#[test]
 fn start_stop_restart_call_expected_systemctl_units() {
     let root = TestDir::new("service-actions");
     let project = root.path().join("project");

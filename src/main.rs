@@ -122,6 +122,9 @@ async fn main() -> Result<()> {
         )
         .with_target(false)
         .without_time()
+        // Diagnostics and warnings belong on stderr so that redirecting stdout
+        // keeps only the data (tables, DRY-RUN plans, summaries) a script parses.
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
