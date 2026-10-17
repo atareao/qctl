@@ -27,6 +27,7 @@ Reviewed surfaces:
 - Service name normalization now removes only the final extension.
 - CI now runs formatting, clippy, dependency audit, build, and tests.
 - Release workflow now runs formatting, clippy, and tests before publishing assets.
+- The merge resolution reintroduced the `logsf` subcommand (lost when `develop` dropped the enum variant) and added `--dry-run` support to `update`.
 - `uninstall` keeps tolerating a stop failure for an already-stopped unit, but now warns with the underlying cause instead of silencing it. Top-level commands propagate command failures.
 
 ## Verification
@@ -34,7 +35,7 @@ Reviewed surfaces:
 Commands executed:
 
 ```bash
-cargo fmt -- --check
+cargo fmt --all -- --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --verbose
@@ -45,8 +46,8 @@ git diff --check
 
 Results:
 
-- Unit tests: 5 passed
-- Integration tests: 9 passed
+- Unit tests: 6 passed
+- Integration tests: 19 passed
 - Clippy: passed with `-D warnings`
 - Formatting: passed
 - Build: passed
@@ -57,8 +58,8 @@ Note: `cargo build --verbose` may print a Cargo cache warning in this sandbox be
 
 ## Residual Risk
 
-- `menu` remains interactive and is not covered by automated integration tests.
-- `logs` and `logsf` stream `journalctl`; tests do not exercise long-running follow mode.
+- `menu` remains interactive; only its EOF/termination behavior is covered by an automated integration test.
+- `logs` and `logsf` stream `journalctl`; tests assert their argument sets but do not exercise long-running follow mode.
 - `check` depends on `/usr/lib/podman/quadlet`; it is not integration-tested because the binary path is host-specific.
 - `clean-volumes --yes` is intentionally destructive. The confirmation and `--dry-run` guard reduce accidental use, but scripts must still use it carefully.
 
