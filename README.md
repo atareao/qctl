@@ -79,13 +79,15 @@ qctl logsf <SERVICE>
 qctl completions <SHELL>
 ```
 
-Todos los comandos aceptan `--dry-run` para mostrar las acciones sin cambiar archivos ni llamar a herramientas externas:
+`--dry-run` afecta a los comandos que modifican el sistema o invocan herramientas externas: `install`, `uninstall`, `reinstall`, `start`, `stop`, `restart`, `update`, `reload` y `clean-volumes`. Estos imprimen las acciones planificadas como `DRY-RUN ...` sin cambiar archivos ni llamar a herramientas externas:
 
 ```bash
 qctl --dry-run install
 qctl --dry-run start voicebox
 qctl --dry-run clean-volumes
 ```
+
+Los comandos de solo consulta (`status`, `logs`, `logsf`, `check`, `completions`) siguen consultando el sistema aunque se use `--dry-run`, porque son de lectura y su utilidad desaparecería al simularlos. `qctl menu --dry-run` también sigue consultando para dibujar la tabla, pero las acciones que mutan (`start`, `stop`, `restart`) respetan `--dry-run`.
 
 ## Ejemplos
 

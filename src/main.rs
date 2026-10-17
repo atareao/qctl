@@ -10,7 +10,7 @@ use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Cell, Color
 use tokio::fs;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
-use tracing::debug;
+use tracing::{debug, warn};
 use tracing_subscriber::EnvFilter;
 
 const QUADLET_EXTENSIONS: &[&str] = &[
@@ -26,7 +26,9 @@ const QUADLET_EXTENSIONS: &[&str] = &[
 #[command(name = "qctl")]
 #[command(about = "Manage quadlets", long_about = None)]
 struct Cli {
-    /// Print what would be done without changing files or calling external tools
+    /// Report planned actions for mutating commands without changing files or
+    /// calling external tools. Read-only commands (status, logs, logsf, check)
+    /// still query the system.
     #[arg(long, global = true)]
     dry_run: bool,
     #[command(subcommand)]
@@ -250,9 +252,11 @@ async fn uninstall(ctx: &AppContext) -> Result<()> {
             if ctx.dry_run {
                 println!("DRY-RUN systemctl --user stop {}", systemd_unit(&stem));
             } else {
-                let _ = systemctl_user("stop", &stem).await;
+                match systemctl_user("stop", &stem).await {
+                    Ok(()) => debug!("Stopped {stem} (if running)"),
+                    Err(err) => warn!("failed to stop {stem} (continuing): {err:#}"),
+                }
             }
-            debug!("Stopped {stem} (if running)");
         }
 
         if ctx.dry_run {
@@ -444,6 +448,8 @@ async fn update(ctx: &AppContext, service: Option<String>) -> Result<()> {
 
     let mut pulled = 0;
     let mut failed = 0;
+    let mut dry_run_pulls = 0;
+    let mut failures = Vec::new();
 
     for path in &containers {
         let unit = strip_dot_extension(&basename(path)?);
@@ -467,22 +473,35 @@ async fn update(ctx: &AppContext, service: Option<String>) -> Result<()> {
 
         if ctx.dry_run {
             println!("DRY-RUN podman pull {image}");
-            pulled += 1;
+            dry_run_pulls += 1;
             continue;
         }
 
-        let status = Command::new("podman").args(["pull", &image]).status().await;
-
-        match status {
-            Ok(s) if s.success() => {
+        match run_command("podman", &["pull", &image], false).await {
+            Ok(()) => {
                 println!("Updated {unit}");
                 pulled += 1;
             }
-            _ => {
+            Err(err) => {
                 eprintln!("Failed to pull image for {unit}");
+                failures.push(format!("  {unit}: {err:#}"));
                 failed += 1;
             }
         }
+    }
+
+    if ctx.dry_run {
+        if dry_run_pulls == 0 {
+            if let Some(ref svc) = service {
+                println!("Container '{svc}' not found in {}", ctx.source_display());
+            } else {
+                println!("No container quadlets found in {}", ctx.source_display());
+            }
+        } else {
+            println!();
+            println!("DRY-RUN summary: {dry_run_pulls} would be pulled");
+        }
+        return Ok(());
     }
 
     if pulled == 0 && failed == 0 {
@@ -496,7 +515,15 @@ async fn update(ctx: &AppContext, service: Option<String>) -> Result<()> {
         println!("Summary: {pulled} updated, {failed} failed");
     }
 
-    Ok(())
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "podman pull failed for {} image(s):\n{}",
+        failures.len(),
+        failures.join("\n")
+    )
 }
 
 async fn status(ctx: &AppContext, service: Option<String>, compact: bool) -> Result<()> {

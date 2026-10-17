@@ -464,6 +464,14 @@ fn dry_run_update_does_not_call_podman() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("DRY-RUN podman pull"));
+    assert!(
+        stdout.contains("DRY-RUN summary: 1 would be pulled"),
+        "dry-run summary must not claim updates: {stdout}"
+    );
+    assert!(
+        !stdout.contains("updated"),
+        "dry-run must not report updates: {stdout}"
+    );
 
     let logged = fs::read_to_string(&log).unwrap_or_default();
     assert!(logged.is_empty(), "podman should not be called: {logged}");
@@ -591,5 +599,146 @@ fn start_reports_all_unit_failures() {
     assert!(
         logged.contains("END okbox.service"),
         "start must wait for every unit before returning: {logged}"
+    );
+}
+
+#[test]
+fn dry_run_start_does_not_invoke_systemctl() {
+    let root = TestDir::new("dry-run-start");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&home).expect("failed to create home");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    write_file(
+        &project.join("voicebox.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(
+        &home,
+        &project,
+        Path::new(&path),
+        &["--dry-run", "start", "voicebox"],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("DRY-RUN systemctl --user start voicebox.service"));
+    assert!(
+        fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "systemctl must not run in dry-run"
+    );
+}
+
+#[test]
+fn dry_run_stop_does_not_invoke_systemctl() {
+    let root = TestDir::new("dry-run-stop");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&home).expect("failed to create home");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    write_file(
+        &project.join("voicebox.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(
+        &home,
+        &project,
+        Path::new(&path),
+        &["--dry-run", "stop", "voicebox"],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("DRY-RUN systemctl --user stop voicebox.service"));
+    assert!(
+        fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "systemctl must not run in dry-run"
+    );
+}
+
+#[test]
+fn dry_run_restart_does_not_invoke_systemctl() {
+    let root = TestDir::new("dry-run-restart");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&home).expect("failed to create home");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    write_file(
+        &project.join("voicebox.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(
+        &home,
+        &project,
+        Path::new(&path),
+        &["--dry-run", "restart", "voicebox"],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("DRY-RUN systemctl --user restart voicebox.service"));
+    assert!(
+        fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "systemctl must not run in dry-run"
+    );
+}
+
+#[test]
+fn dry_run_uninstall_does_not_stop_or_remove() {
+    let root = TestDir::new("dry-run-uninstall");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    let target = home.join(".config").join("containers").join("systemd");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    let source = project.join("voicebox.container");
+    let link = target.join("voicebox.container");
+    write_file(&source, "[Container]\nImage=example\n");
+    symlink(&source, &link).expect("failed to create test symlink");
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(
+        &home,
+        &project,
+        Path::new(&path),
+        &["--dry-run", "uninstall"],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("DRY-RUN systemctl --user stop voicebox.service"));
+    assert!(stdout.contains("DRY-RUN remove"));
+
+    assert!(link.exists(), "dry-run uninstall must not remove the link");
+    let logged = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !logged.contains("--user stop"),
+        "systemctl stop must not run in dry-run: {logged}"
+    );
+    assert!(
+        !logged.contains("daemon-reload"),
+        "daemon-reload must not run in dry-run: {logged}"
     );
 }
