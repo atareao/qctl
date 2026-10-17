@@ -47,7 +47,7 @@ git diff --check
 Results:
 
 - Unit tests: 6 passed
-- Integration tests: 19 passed
+- Integration tests: 20 passed
 - Clippy: passed with `-D warnings`
 - Formatting: passed
 - Build: passed
