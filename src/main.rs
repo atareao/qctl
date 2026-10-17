@@ -3,12 +3,13 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Cell, Color, Table};
 use tokio::fs;
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
 
@@ -299,18 +300,18 @@ async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
         }
 
         println!("Starting {unit}");
-        handles.push(tokio::spawn(async move {
-            systemctl_user("start", &unit).await?;
-            debug!("Started {unit}");
-            Ok::<(), anyhow::Error>(())
-        }));
+        let unit_for_task = unit.clone();
+        handles.push((
+            unit,
+            tokio::spawn(async move {
+                systemctl_user("start", &unit_for_task).await?;
+                debug!("Started {unit_for_task}");
+                Ok::<(), anyhow::Error>(())
+            }),
+        ));
     }
 
-    for handle in handles {
-        handle.await??;
-    }
-
-    Ok(())
+    await_unit_tasks("start", handles).await
 }
 
 async fn ensure_targets_installed(ctx: &AppContext, targets: &[String]) -> Result<()> {
@@ -363,18 +364,18 @@ async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
             continue;
         }
 
-        handles.push(tokio::spawn(async move {
-            systemctl_user("stop", &unit).await?;
-            debug!("Stopped {unit}");
-            Ok::<(), anyhow::Error>(())
-        }));
+        let unit_for_task = unit.clone();
+        handles.push((
+            unit,
+            tokio::spawn(async move {
+                systemctl_user("stop", &unit_for_task).await?;
+                debug!("Stopped {unit_for_task}");
+                Ok::<(), anyhow::Error>(())
+            }),
+        ));
     }
 
-    for handle in handles {
-        handle.await??;
-    }
-
-    Ok(())
+    await_unit_tasks("stop", handles).await
 }
 
 async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
@@ -392,18 +393,46 @@ async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
             continue;
         }
 
-        handles.push(tokio::spawn(async move {
-            systemctl_user("restart", &unit).await?;
-            debug!("Restarted {unit}");
-            Ok::<(), anyhow::Error>(())
-        }));
+        let unit_for_task = unit.clone();
+        handles.push((
+            unit,
+            tokio::spawn(async move {
+                systemctl_user("restart", &unit_for_task).await?;
+                debug!("Restarted {unit_for_task}");
+                Ok::<(), anyhow::Error>(())
+            }),
+        ));
     }
 
-    for handle in handles {
-        handle.await??;
+    await_unit_tasks("restart", handles).await
+}
+
+/// Waits for every spawned unit task to finish, collecting all failures instead
+/// of aborting at the first one, and reports an aggregated error that names each
+/// failing unit.
+async fn await_unit_tasks(
+    action: &str,
+    handles: Vec<(String, JoinHandle<Result<()>>)>,
+) -> Result<()> {
+    let mut failures = Vec::new();
+
+    for (unit, handle) in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => failures.push(format!("  {unit}: {err:#}")),
+            Err(join_err) => failures.push(format!("  {unit}: task failed: {join_err}")),
+        }
     }
 
-    Ok(())
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "systemctl {action} failed for {} unit(s):\n{}",
+        failures.len(),
+        failures.join("\n")
+    )
 }
 
 async fn update(ctx: &AppContext, service: Option<String>) -> Result<()> {

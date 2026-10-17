@@ -165,6 +165,37 @@ fn fake_journalctl(bin: &Path, log: &Path) {
         .expect("failed to chmod fake journalctl");
 }
 
+/// A fake `systemctl` that fails for `failbox.service` and, for `okbox.service`,
+/// writes `START` then sleeps then writes `END` so tests can prove qctl waited
+/// for every unit before reporting.
+fn fake_failing_start_systemctl(bin: &Path, log: &Path) {
+    let script = format!(
+        r#"#!/bin/sh
+echo "$@" >> {log}
+if [ "$2" = "start" ]; then
+  if [ "$3" = "failbox.service" ]; then
+    echo "failbox exploded" >&2
+    exit 1
+  fi
+  if [ "$3" = "okbox.service" ]; then
+    echo "START okbox.service" >> {log}
+    sleep 1
+    echo "END okbox.service" >> {log}
+  fi
+fi
+if [ "$2" = "is-active" ]; then
+  echo active
+fi
+exit 0
+"#,
+        log = log.display()
+    );
+    let systemctl = bin.join("systemctl");
+    write_file(&systemctl, &script);
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755))
+        .expect("failed to chmod fake systemctl");
+}
+
 #[test]
 fn dry_run_install_reports_actions_without_touching_home() {
     let root = TestDir::new("dry-run-install");
@@ -513,5 +544,52 @@ fn menu_exits_on_eof_without_looping() {
         stdout.len() < 10_000,
         "menu must not spin on EOF, produced {} bytes",
         stdout.len()
+    );
+}
+
+#[test]
+fn start_reports_all_unit_failures() {
+    let root = TestDir::new("start-failures");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    let target = home.join(".config").join("containers").join("systemd");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_failing_start_systemctl(&bin, &log);
+    for name in ["failbox", "okbox"] {
+        let source = project.join(format!("{name}.container"));
+        write_file(&source, "[Container]\nImage=example\n");
+        symlink(&source, target.join(format!("{name}.container")))
+            .expect("failed to create test symlink");
+    }
+
+    let child = Command::new(env!("CARGO_BIN_EXE_qctl"))
+        .arg("start")
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("USER", "qctl-test")
+        .env_remove("RUST_LOG")
+        .env("PATH", prepend_path(&bin))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn qctl");
+    let output = wait_with_timeout(child, Duration::from_secs(10))
+        .expect("qctl start did not finish in time");
+
+    assert!(!output.status.success(), "start must fail: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failbox"),
+        "stderr must name the failing unit: {stderr}"
+    );
+
+    let logged = fs::read_to_string(&log).expect("missing systemctl log");
+    assert!(
+        logged.contains("END okbox.service"),
+        "start must wait for every unit before returning: {logged}"
     );
 }
