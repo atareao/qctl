@@ -71,11 +71,20 @@ qctl stop [SERVICE]
 qctl restart [SERVICE]
 qctl update [SERVICE]
 qctl status [SERVICE] [--compact]
-qctl clean-volumes
+qctl menu [SERVICE]
+qctl clean-volumes [--yes]
 qctl check <QUADLET>
 qctl logs <SERVICE>
 qctl logsf <SERVICE>
 qctl completions <SHELL>
+```
+
+Todos los comandos aceptan `--dry-run` para mostrar las acciones sin cambiar archivos ni llamar a herramientas externas:
+
+```bash
+qctl --dry-run install
+qctl --dry-run start voicebox
+qctl --dry-run clean-volumes
 ```
 
 ## Ejemplos
@@ -85,11 +94,13 @@ cargo run -- install
 cargo run -- start voicebox
 cargo run -- status
 cargo run -- status --compact
+cargo run -- menu
 cargo run -- stop voicebox
 cargo run -- restart voicebox
 cargo run -- update
 cargo run -- update voicebox
 cargo run -- clean-volumes
+cargo run -- clean-volumes --yes
 cargo run -- check quadlets/voicebox.container
 cargo run -- logs voicebox
 ```
@@ -111,6 +122,25 @@ qctl completions bash > ~/.local/share/bash-completion/completions/qctl
 qctl completions zsh > "${fpath[1]}/_qctl"
 ```
 
+## Menú interactivo
+
+`qctl menu` muestra una tabla interactiva de servicios y permite arrancar, parar, reiniciar o consultar logs sin recordar todos los comandos.
+
+Acciones disponibles:
+
+- `número`: alterna entre arrancar y parar según el estado actual
+- `s número` o `número s`: arranca el servicio
+- `p número` o `número p`: para el servicio
+- `r número` o `número r`: reinicia el servicio
+- `l número` o `número l`: muestra logs recientes y vuelve al menú
+- `q`: sale del menú
+
+El menú también incluye unidades ya enlazadas en `$HOME/.config/containers/systemd`, aunque se ejecute desde otro directorio.
+
+## Limpieza de volúmenes
+
+`qctl clean-volumes` elimina los volúmenes de Podman declarados con `VolumeName=` en archivos `.volume`. Por defecto pide confirmación antes de borrar. Usa `--yes` para confirmar desde scripts, o `--dry-run` para ver qué volúmenes se borrarían.
+
 ## Salida de status
 
 En la tabla de `status` se usan emojis para facilitar lectura rápida:
@@ -124,6 +154,12 @@ En la tabla de `status` se usan emojis para facilitar lectura rápida:
   - `⚫` n/a
 
 El resumen final también incluye estos estados con su significado.
+
+Con `--compact`, la salida contiene solo una línea por unidad en formato tabulado:
+
+```text
+<unit>	<link>	<state>
+```
 
 ## Estructura esperada
 
