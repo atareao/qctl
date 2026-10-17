@@ -360,10 +360,7 @@ async fn update(ctx: &AppContext, service: Option<String>) -> Result<()> {
         };
 
         println!("Pulling {unit}: {image}");
-        let status = Command::new("podman")
-            .args(["pull", &image])
-            .status()
-            .await;
+        let status = Command::new("podman").args(["pull", &image]).status().await;
 
         match status {
             Ok(s) if s.success() => {
