@@ -28,7 +28,7 @@ git flow init -f -d
 | `release/*` | Preparación de una versión: bump de versión y últimos ajustes. | Sale de `develop`, vuelve a `main` vía PR y deja merge-back a `develop` con `release finish`. |
 | `hotfix/*` | Corrección urgente sobre producción. | Sale de `main`, vuelve a `main` vía PR y deja merge-back a `develop` con `hotfix finish`. |
 
-Esta regla no es solo una convención: el workflow [`branch-guard.yml`](.github/workflows/branch-guard.yml) rechaza cualquier PR hacia `main` cuyo origen no sea `develop`, `release/*` o `hotfix/*`.
+Esta regla no es solo una convención: el workflow [`branch-guard.yml`](.github/workflows/branch-guard.yml) rechaza cualquier PR hacia `main` cuyo origen no sea `release/*` o `hotfix/*`. En gitflow estricto `develop` nunca se mergea directamente a `main`: se abre una rama `release/X.Y.Z`.
 
 ## Commits
 
@@ -75,12 +75,14 @@ git flow release start 0.3.0
 # subir .vampus.yml (current_version) y Cargo.toml
 # commit: chore(release): bump version to 0.3.0
 git flow release publish 0.3.0
-gh pr create --base main --fill
+gh pr create --base main --head release/0.3.0 --fill
 # tras el merge:
 git flow release finish -m "v0.3.0" 0.3.0
 git push origin main --tags
 gh release create v0.3.0 --target main --title v0.3.0 --generate-notes
 ```
+
+El PR sale de `release/0.3.0`, nunca de `develop`: un merge `develop → main` lo bloquea [`branch-guard.yml`](.github/workflows/branch-guard.yml) a propósito.
 
 Tres detalles que se olvidan:
 
@@ -96,7 +98,7 @@ git pull --ff-only
 git flow hotfix start 0.2.3
 # subir .vampus.yml (current_version) y Cargo.toml
 # commit: chore(release): bump version to 0.2.3
-gh pr create --base main --fill
+gh pr create --base main --head hotfix/0.2.3 --fill
 # tras el merge:
 git flow hotfix finish -m "v0.2.3" 0.2.3
 git push origin main --tags
@@ -110,7 +112,7 @@ gh release create v0.2.3 --target main --title v0.2.3 --generate-notes
 | Workflow | Se dispara con | Qué hace |
 | --- | --- | --- |
 | `rust.yml` | push a `main`, `develop`, `release/**`, `hotfix/**`; PRs hacia `main` y `develop` | `fmt`, `clippy -D warnings`, `cargo audit`, build y tests. |
-| `branch-guard.yml` | PRs hacia `main` (opened, edited, synchronize, reopened) | Rechaza orígenes distintos de `develop`, `release/*` o `hotfix/*`. |
+| `branch-guard.yml` | PRs hacia `main` (opened, edited, synchronize, reopened) | Rechaza orígenes distintos de `release/*` o `hotfix/*`. |
 | `release.yml` | Creación de un GitHub Release | Compila el binario musl estático, calcula el checksum y sube los assets. |
 
 ## Ajustes recomendados del repositorio

@@ -20,11 +20,11 @@ jobs:
         run: |
           echo "PR desde '$HEAD_REF' hacia 'main'"
           case "$HEAD_REF" in
-            develop|release/*|hotfix/*)
+            release/*|hotfix/*)
               echo "✅ Origen válido según gitflow."
               ;;
             *)
-              echo "::error::Los PRs hacia main solo pueden venir de develop, release/* o hotfix/* (gitflow). Origen: $HEAD_REF"
+              echo "::error::Los PRs hacia main solo pueden venir de release/* o hotfix/* (gitflow). Origen: $HEAD_REF"
               exit 1
               ;;
           esac
