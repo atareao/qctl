@@ -11,7 +11,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo audit               # dependency advisories (not installed by default)
 ```
 
-CI (`.github/workflows/rust.yml`) runs `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo audit`, `cargo build --verbose` and `cargo test --verbose` on push/PR to `main` and `develop`.
+CI (`.github/workflows/rust.yml`) runs `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo audit`, `cargo build --verbose` and `cargo test --verbose` on push to `main`, `develop`, `release/**` and `hotfix/**`, and on PRs to `main` and `develop`.
 
 Both workflows run on `ubuntu-24.04` with `actions/checkout@v7`. Release builds (`.github/workflows/release.yml`) cross-compile to `x86_64-unknown-linux-musl` with `RUSTFLAGS="-C target-feature=+crt-static"` for fully static binaries. Triggered by GitHub Release creation.
 
@@ -35,6 +35,15 @@ Quadlets are discovered from `./quadlets/` and `.` (current dir), symlinked to `
 ## Version management
 
 Version is defined in `Cargo.toml` and bumped via `.vampus.yml` (`current_version`) — not manually edited.
+
+## Branching model (gitflow)
+
+- `develop` is the integration branch; every feature PR targets `develop`.
+- `main` only receives merges from `release/*` and `hotfix/*` (enforced by `branch-guard.yml`); never commit or push directly to `main`.
+- Version bumps happen on the release branch (`chore(release): …`), editing `.vampus.yml` and `Cargo.toml`.
+- `git flow release finish` / `hotfix finish` merge to `main`, tag `vX.Y.Z` and merge back to `develop`; the merge-back is mandatory.
+- Creating the release (`gh release create --target main`) triggers `release.yml`; verify the assets are uploaded.
+- See `CONTRIBUTING.md` for the full procedure.
 
 ## Quirks
 
