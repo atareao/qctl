@@ -29,6 +29,21 @@ CLI en Rust para gestionar quadlets de forma simple y segura: instalación de en
 
 ## Instalación y compilación
 
+### Binario precompilado
+
+Cada release publica un binario estático para Linux (`x86_64-unknown-linux-musl`, sin dependencias dinámicas) junto a su checksum `.sha256`:
+
+```bash
+curl -LO https://github.com/atareao/qctl/releases/latest/download/qctl-linux-x86_64
+curl -LO https://github.com/atareao/qctl/releases/latest/download/qctl-linux-x86_64.sha256
+sha256sum -c qctl-linux-x86_64.sha256
+chmod +x qctl-linux-x86_64
+sudo install -m 755 qctl-linux-x86_64 /usr/local/bin/qctl
+qctl --version
+```
+
+### Compilación desde el código
+
 Compilación de desarrollo:
 
 ```bash

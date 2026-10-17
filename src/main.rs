@@ -23,7 +23,7 @@ const QUADLET_EXTENSIONS: &[&str] = &[
 ];
 
 #[derive(Debug, Parser)]
-#[command(name = "qctl")]
+#[command(name = "qctl", version)]
 #[command(about = "Manage quadlets", long_about = None)]
 struct Cli {
     /// Report planned actions for mutating commands without changing files or
