@@ -27,8 +27,9 @@ const QUADLET_EXTENSIONS: &[&str] = &[
 #[command(about = "Manage quadlets", long_about = None)]
 struct Cli {
     /// Report planned actions for mutating commands without changing files or
-    /// calling external tools. Read-only commands (status, logs, logsf, check)
-    /// still query the system.
+    /// running mutating actions; the final status table still queries
+    /// `systemctl --user is-active`. Read-only commands (status, logs, logsf,
+    /// check) still query the system.
     #[arg(long, global = true)]
     dry_run: bool,
     #[command(subcommand)]
@@ -223,7 +224,7 @@ async fn install(ctx: &AppContext) -> Result<()> {
         let name = basename(&src)?;
         let dest = ctx.target_dir.join(&name);
 
-        if source_is_in_target_dir(&src, target_canon.as_deref()).await? {
+        if source_is_in_target_dir(&src, target_canon.as_deref()).await {
             println!("Skipping {name} (already in target dir)");
             continue;
         }

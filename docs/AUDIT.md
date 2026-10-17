@@ -22,7 +22,7 @@ Reviewed surfaces:
 - `start`, `stop`, and `restart` now wait for every unit and report an aggregated error that names each failing unit.
 - External command failures now include command, exit status, and stderr.
 - `clean-volumes` now requires confirmation by default and supports `--yes` for scripts.
-- A global `--dry-run` mode now reports planned actions for commands that mutate the system or invoke external tools (`install`, `uninstall`, `reinstall`, `start`, `stop`, `restart`, `update`, `reload`, `clean-volumes`) without changing files or calling external tools. Read-only commands (`status`, `logs`, `logsf`, `check`) still query the system when `--dry-run` is used.
+- A global `--dry-run` mode now reports planned actions for commands that mutate the system or invoke external tools (`install`, `uninstall`, `reinstall`, `start`, `stop`, `restart`, `update`, `reload`, `clean-volumes`) without changing files or running mutating actions; the final status table still queries `systemctl --user is-active`. Read-only commands (`status`, `logs`, `logsf`, `check`) still query the system when `--dry-run` is used.
 - `status --compact` now emits only compact script-friendly rows.
 - Service name normalization now removes only the final extension.
 - CI now runs formatting, clippy, dependency audit, build, and tests.

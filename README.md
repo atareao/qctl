@@ -79,7 +79,7 @@ qctl logsf <SERVICE>
 qctl completions <SHELL>
 ```
 
-`--dry-run` afecta a los comandos que modifican el sistema o invocan herramientas externas: `install`, `uninstall`, `reinstall`, `start`, `stop`, `restart`, `update`, `reload` y `clean-volumes`. Estos imprimen las acciones planificadas como `DRY-RUN ...` sin cambiar archivos ni llamar a herramientas externas:
+`--dry-run` afecta a los comandos que modifican el sistema o invocan herramientas externas: `install`, `uninstall`, `reinstall`, `start`, `stop`, `restart`, `update`, `reload` y `clean-volumes`. Estos imprimen las acciones planificadas como `DRY-RUN ...` sin cambiar archivos ni ejecutar acciones mutadoras; la tabla de estado final sí consulta `systemctl --user is-active`:
 
 ```bash
 qctl --dry-run install
