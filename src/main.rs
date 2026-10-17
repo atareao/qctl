@@ -89,6 +89,11 @@ enum Commands {
         /// Systemd user unit name
         service: String,
     },
+    /// Show logs in follow mode with extra metadata
+    Logsf {
+        /// Systemd user unit name
+        service: String,
+    },
     /// Reload systemd user daemon
     Reload,
     /// Generate shell completions
@@ -156,6 +161,7 @@ async fn main() -> Result<()> {
         Commands::CleanVolumes { yes } => clean_volumes(&ctx, yes).await?,
         Commands::Check { quadlet } => check_quadlet(&ctx, quadlet).await?,
         Commands::Logs { service } => logs(service, false).await?,
+        Commands::Logsf { service } => logs(service, true).await?,
         Commands::Reload => daemon_reload(&ctx).await?,
         Commands::Completions { .. } => unreachable!(),
     }

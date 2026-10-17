@@ -108,6 +108,14 @@ fn fake_podman(bin: &Path, log: &Path) {
         .expect("failed to chmod fake podman");
 }
 
+fn fake_journalctl(bin: &Path, log: &Path) {
+    let script = format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display());
+    let journalctl = bin.join("journalctl");
+    write_file(&journalctl, &script);
+    fs::set_permissions(&journalctl, fs::Permissions::from_mode(0o755))
+        .expect("failed to chmod fake journalctl");
+}
+
 #[test]
 fn dry_run_install_reports_actions_without_touching_home() {
     let root = TestDir::new("dry-run-install");
@@ -379,4 +387,58 @@ fn dry_run_update_does_not_call_podman() {
 
     let logged = fs::read_to_string(&log).unwrap_or_default();
     assert!(logged.is_empty(), "podman should not be called: {logged}");
+}
+
+#[test]
+fn logsf_uses_extra_journalctl_flags() {
+    let root = TestDir::new("logsf");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    let log = root.path().join("journalctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&home).expect("failed to create home");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_journalctl(&bin, &log);
+    write_file(
+        &project.join("voicebox.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["logsf", "voicebox"]);
+    assert!(output.status.success(), "{output:?}");
+
+    let logged = fs::read_to_string(&log).expect("missing journalctl log");
+    assert!(
+        logged.contains("--user -xsfu voicebox.service"),
+        "logsf must pass extra flags: {logged}"
+    );
+}
+
+#[test]
+fn logs_uses_plain_journalctl_flags() {
+    let root = TestDir::new("logs");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    let log = root.path().join("journalctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&home).expect("failed to create home");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_journalctl(&bin, &log);
+    write_file(
+        &project.join("voicebox.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["logs", "voicebox"]);
+    assert!(output.status.success(), "{output:?}");
+
+    let logged = fs::read_to_string(&log).expect("missing journalctl log");
+    assert!(
+        logged.contains("--user -u voicebox.service -f --since 1 hour ago"),
+        "logs must pass plain flags: {logged}"
+    );
 }

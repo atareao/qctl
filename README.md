@@ -103,6 +103,7 @@ cargo run -- clean-volumes
 cargo run -- clean-volumes --yes
 cargo run -- check quadlets/voicebox.container
 cargo run -- logs voicebox
+cargo run -- logsf voicebox
 ```
 
 `qctl start` también sirve como atajo de instalación inicial: si faltan enlaces en `$HOME/.config/containers/systemd`, ejecuta la instalación antes de hacer `start`.
