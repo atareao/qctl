@@ -143,3 +143,67 @@ Decisions and compatibility:
   `Container '<name>' not found`; it now exits non-zero with
   `no such quadlet: <name>`, consistent with the other unit commands.
 
+## Round 2026-10-18 — Quadlet discovery scope and name collisions
+
+Review of issue #12 ("install: quadlets deeper than one level below the source dir
+are not collected"). No code change was made: the finding is a documented,
+deliberate scope limitation, so it is reported as informational and the issue was
+closed as `not planned`.
+
+Finding:
+
+- **INFO — one-level discovery diverges from the Quadlet runtime.** `qctl` collects
+  quadlets only from the immediate children of `./quadlets/` and the current
+  directory. `podman-systemd.unit(5)` documents that, in the user unit search paths,
+  "Quadlet will recursively search and run the unit files present in these
+  subdirectories". The target directory of `qctl`
+  (`$HOME/.config/containers/systemd`) is one of those search paths, so a quadlet
+  living in a subdirectory of it — for example
+  `~/.config/containers/systemd/web/api.container` — is loaded by the runtime while
+  `qctl install`, `qctl start` and `qctl start <name>` ignore it. The omission is
+  silent on the `qctl` side because the file is outside its scan scope; it is not a
+  failure to detect a duplicate.
+
+  Measured with the real generator (`/usr/lib/podman/quadlet`, podman 6.1.2) against
+  a throwaway `HOME`:
+
+  - `~/.config/containers/systemd/web/nginx.container` is loaded and produces
+    `nginx.service` with `SourcePath=` pointing at that path.
+  - Nested quadlets at two and three levels are loaded, directory symlinks inside the
+    search paths are followed, hidden directories (`.hidden/`, `.git/`) are scanned,
+    and symlink cycles do not hang the generator.
+  - Recursion landed in Quadlet v4.7.0 (commit `413552e`, 2023-07-20); directory
+    symlinks in search paths were broken from v4.7.0 to v4.8.x (upstream issue
+    #20504); recursion under `/etc/containers/systemd/users/<uid>/` in rootless mode
+    was broken until v5.4.0 (upstream issue #24783, PR #24815, January 2025).
+
+  The decision was to keep the one-level scan and document the divergence instead of
+  making discovery recursive. Making it recursive would walk trees unrelated to the
+  current project, widen the blast radius tracked in #5 and multiply false positives.
+
+Name collisions:
+
+- **INFO — the unit name comes from the basename, and neither side resolves the
+  collision.** A `web/api.container` and a `db/api.container` both compete for
+  `api.service`. Inside the first level `qctl` detects this and fails loudly with
+  `duplicate quadlet file name '<name>' found in <path> and <path>` (non-zero exit);
+  it never picks one silently. Between nested subdirectories the files are outside the
+  `qctl` scan, and the runtime itself gives no warning: the same measurement produced
+  a single `api.service` (the `db` entry won) and the `web` image was lost silently.
+  The canonical remedy is the `ServiceName=` key in the quadlet, which is available in
+  `[Container]`, `[Pod]`, `[Network]`, `[Volume]`, `[Build]`, `[Image]` and
+  `[Artifact]`; it overrides the unit name without renaming the file. It must not be
+  confused with `ContainerName=`, which changes the Podman container name
+  (`systemd-%N` by default), not the systemd unit name.
+
+  Known limitation, unchanged by this round: `qctl` resolves a name to a file by
+  basename. A quadlet carrying `ServiceName=api-web` is still called `api.container`,
+  so `qctl install` links it and the runtime produces `api-web.service`, but
+  `qctl start api-web` fails with `no such quadlet: api-web`. Addressing renamed units
+  would require a code change and is out of scope here.
+
+Verification:
+
+- Documentation only. No source, test, spec or workflow change.
+- Test suite unchanged: 6 unit tests and 32 integration tests (38 total).
+
