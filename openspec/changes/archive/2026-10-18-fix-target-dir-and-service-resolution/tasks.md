@@ -34,8 +34,8 @@
 ## 4. Release
 
 - [x] 4.1 `openspec validate fix-target-dir-and-service-resolution --strict`.
-- [ ] 4.2 `openspec archive fix-target-dir-and-service-resolution` tras el merge.
-- [ ] 4.3 `release/0.3.0` con el ritual de `CONTRIBUTING.md`.
+- [x] 4.2 `openspec archive fix-target-dir-and-service-resolution` tras el merge. (Hecho: archivado como 2026-10-18-fix-target-dir-and-service-resolution.)
+- [x] 4.3 `release/0.3.0` con el ritual de `CONTRIBUTING.md`. (Hecho: release v0.3.0 publicado y assets verificados.)
 
 ## 5. Segunda ronda (revisión): quadlets que ya viven en el target
 
