@@ -273,8 +273,8 @@ async fn source_is_in_target_dir(src: &Path, target_canon: Option<&Path>) -> boo
 
 /// True when `<unit>.container` counts as installed for the target directory:
 /// either an entry directly inside it — the symlink `install` creates, or a
-/// regular file — or a quadlet living anywhere inside its tree, for example
-/// `<target_dir>/quadlets/<unit>.container`.
+/// regular file — or a quadlet living one level below the target directory, for
+/// example `<target_dir>/quadlets/<unit>.container`.
 ///
 /// `install` deliberately leaves quadlets that already live inside the target
 /// tree unlinked, so commands that act on units must accept them by name instead

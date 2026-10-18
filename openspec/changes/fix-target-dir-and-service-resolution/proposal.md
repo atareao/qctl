@@ -53,7 +53,7 @@ looked for `<target_dir>/<name>.container`, did not find it and either did nothi
 - **B1 — `qctl start` without arguments did nothing in the nested layout.**
   Exit code `0` and only `daemon-reload`, while `develop` at least ran
   `systemctl --user start other.service`. The "installed" predicate now also accepts
-  a quadlet living anywhere inside the target tree, so the unit is started again.
+  a quadlet living one level below the target directory, so the unit is started again.
 - **M1 — `start <name>` recreated the redundant self-symlink.** `install_single`
   did not consult `source_is_in_target_dir`. It now does, and creates nothing when
   the origin already lives inside the target tree. `README.md`'s claim that `qctl`

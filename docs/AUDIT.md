@@ -102,8 +102,8 @@ recreated the very self-symlink #3 removes. Both are fixed:
 - **B1 — `start` without arguments did nothing in the nested layout.** With the
   current directory set to the target directory and a nested `quadlets/` subdirectory,
   `qctl start` only ran `daemon-reload` and exited `0`, starting no unit. The
-  "installed" predicate now also accepts a quadlet living anywhere inside the target
-  tree, so the unit is started. Covered by
+  "installed" predicate now also accepts a quadlet living one level below the target
+  directory, so the unit is started. Covered by
   `start_without_arguments_starts_units_in_target_subdirs`.
 - **M1 — `start <name>` recreated the redundant self-symlink.** `install_single`
   did not consult `source_is_in_target_dir` and linked an origin already inside the

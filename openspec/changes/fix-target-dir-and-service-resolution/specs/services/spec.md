@@ -45,7 +45,7 @@ symlink, pointing at the project source. It SHALL NOT install unrelated quadlets
 
 A container unit SHALL count as installed when `<target_dir>/<unit>.container` exists
 — as the symlink `install` creates or as a regular file — **or** when
-`<unit>.container` lives anywhere inside the target directory tree, for example
+`<unit>.container` lives one level below the target directory, for example
 `<target_dir>/quadlets/<unit>.container`. `start` SHALL start such a unit, with or
 without a service argument, without `qctl` creating a redundant symlink for it first.
 
