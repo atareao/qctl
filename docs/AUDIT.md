@@ -62,6 +62,10 @@ Note: `cargo build --verbose` may print a Cargo cache warning in this sandbox be
 - `logs` and `logsf` stream `journalctl`; tests assert their argument sets but do not exercise long-running follow mode.
 - `check` depends on `/usr/lib/podman/quadlet`; it is not integration-tested because the binary path is host-specific.
 - `clean-volumes --yes` is intentionally destructive. The confirmation and `--dry-run` guard reduce accidental use, but scripts must still use it carefully.
+- A bounded external command that times out is killed as a direct child only;
+  any process it forked survives and is not reaped. `systemctl --user` does not
+  fork long-lived children, but `podman` could leave one behind. `--timeout 0`
+  disables the deadline entirely.
 
 ## Recommended Next Steps
 
@@ -207,3 +211,72 @@ Verification:
 - Documentation only. No source, test, spec or workflow change.
 - Test suite unchanged: 6 unit tests and 32 integration tests (38 total).
 
+
+## Round 2026-10-18 — Unit command scope and external command hardening
+
+Fixes for two findings from the PR #2 review, proposed and validated through the
+OpenSpec change `scope-unit-commands-and-harden-execution`.
+
+Findings fixed:
+
+- **#5 — `stop` and `restart` reached into other projects.** `resolve_targets`
+  widened the target set with every `.container` in `$HOME/.config/containers/systemd`
+  so that `menu` and `status` could show what any project had installed. That widening
+  applied to the destructive commands too, so `cd projectA && qctl stop` also stopped
+  the units `projectB` had linked into the same `HOME`. Resolution now has two explicit
+  scopes: `start`, `stop` and `restart` without a service operate only on the current
+  project's quadlets, while `status` and `menu` keep the wide view. The status table
+  printed after a mutating unit command follows the same project scope the command
+  acted on, so it cannot look like the command skipped units it was never meant to
+  touch.
+- **#6 — no `--no-pager` and no timeouts.** `journalctl` was invoked without
+  `--no-pager`, so a pager configured by the user could take over the terminal of a
+  command meant to be scriptable; and the external commands `qctl` waits for
+  (`systemctl --user`, `/usr/lib/podman/quadlet`, `podman volume rm`) had no deadline,
+  so a hung `systemctl` could block the process until systemd's own `TimeoutStartSec`.
+  Both now get the same treatment: `journalctl` always passes `--no-pager`, and the
+  bounded commands run under a deadline.
+
+Timeout contract:
+
+- Default 60 seconds, overridden by the global `--timeout <SECONDS>` option.
+- `--timeout 0` disables the deadline.
+- On expiry `qctl` kills the process and exits non-zero with
+  `command timed out after <n>s: <command>`, which names the unit when the invocation
+  targets one.
+- Two deliberate exemptions: `podman pull` (network-bound, may legitimately exceed the
+  default) and `logs`/`logsf` (both run `journalctl` in follow mode with `-f` and must
+  stream until the user interrupts them).
+
+Tests covering each fix:
+
+| Fix | Integration tests |
+| --- | --- |
+| #5 (stop) | `stop_without_arguments_does_not_stop_other_project_units`, `stop_table_lists_only_the_current_project`, `stop_with_explicit_name_still_resolves_target_dir` |
+| #5 (restart) | `restart_without_arguments_does_not_restart_other_project_units` |
+| #5 (start) | `start_without_arguments_does_not_start_other_project_units` |
+| #5 (wide view kept) | `status_reports_units_from_every_project` |
+| #6 (pager) | `logs_uses_plain_journalctl_flags`, `logsf_uses_extra_journalctl_flags` |
+| #6 (deadline) | `systemctl_timeout_fails_with_unit_and_action`, `timeout_zero_disables_the_limit`, `negative_timeout_is_rejected` |
+| #6 (exemptions) | `podman_pull_is_not_bounded_by_the_timeout`, `logs_is_not_bounded_by_the_timeout` |
+
+Verification:
+
+- Unit tests: 6 passed
+- Integration tests: 43 passed (49 total)
+- `cargo fmt --all -- --check` and
+  `cargo clippy --all-targets --all-features -- -D warnings` clean.
+
+Decisions and compatibility:
+
+- **Breaking change**: `start`, `stop` and `restart` without a service no longer reach
+  units another project linked into the same target directory. Documented in
+  `README.md`.
+- A unit whose source was removed and is no longer collected by the project is
+  also out of scope for argument-less commands; address it by name, which still
+  resolves against the target directory.
+- An explicit service name is unchanged: it still resolves against both the project
+  source directories and the target directory, so an installed unit whose source
+  disappeared remains addressable by name.
+- The `--dry-run` contract and the existing messages (`Skipping …`, `no such quadlet`,
+  `duplicate quadlet file name`) are untouched.
