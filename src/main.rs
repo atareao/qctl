@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -32,6 +34,9 @@ struct Cli {
     /// check) still query the system.
     #[arg(long, global = true)]
     dry_run: bool,
+    /// Timeout in seconds for external commands; 0 disables the limit
+    #[arg(long, global = true, value_name = "SECONDS", default_value_t = 60)]
+    timeout: u64,
     #[command(subcommand)]
     command: Commands,
 }
@@ -113,6 +118,8 @@ struct AppContext {
     target_dir: PathBuf,
     user: String,
     dry_run: bool,
+    /// Deadline applied to bounded external commands; `None` waits forever.
+    timeout: Option<Duration>,
 }
 
 #[tokio::main]
@@ -135,35 +142,37 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let ctx = AppContext::new(cli.dry_run)?;
+    let ctx = AppContext::new(cli.dry_run, cli.timeout)?;
 
     match cli.command {
         Commands::Install => {
             install(&ctx).await?;
-            status(&ctx, None, false).await?;
+            status(&ctx, None, false, TargetScope::Project).await?;
         }
         Commands::Uninstall => {
             uninstall(&ctx).await?;
-            status(&ctx, None, false).await?;
+            status(&ctx, None, false, TargetScope::Project).await?;
         }
         Commands::Reinstall => {
             reinstall(&ctx).await?;
-            status(&ctx, None, false).await?;
+            status(&ctx, None, false, TargetScope::Project).await?;
         }
         Commands::Start { service } => {
             start(&ctx, service.clone()).await?;
-            status(&ctx, service, false).await?;
+            status(&ctx, service, false, TargetScope::Project).await?;
         }
         Commands::Stop { service } => {
             stop(&ctx, service.clone()).await?;
-            status(&ctx, service, false).await?;
+            status(&ctx, service, false, TargetScope::Project).await?;
         }
         Commands::Restart { service } => {
             restart(&ctx, service.clone()).await?;
-            status(&ctx, service, false).await?;
+            status(&ctx, service, false, TargetScope::Project).await?;
         }
         Commands::Update { service } => update(&ctx, service).await?,
-        Commands::Status { service, compact } => status(&ctx, service, compact).await?,
+        Commands::Status { service, compact } => {
+            status(&ctx, service, compact, TargetScope::Wide).await?
+        }
         Commands::Menu { service } => menu(&ctx, service).await?,
         Commands::CleanVolumes { yes } => clean_volumes(&ctx, yes).await?,
         Commands::Check { quadlet } => check_quadlet(&ctx, quadlet).await?,
@@ -177,7 +186,7 @@ async fn main() -> Result<()> {
 }
 
 impl AppContext {
-    fn new(dry_run: bool) -> Result<Self> {
+    fn new(dry_run: bool, timeout_secs: u64) -> Result<Self> {
         let root_dir = std::env::current_dir().context("failed to resolve current directory")?;
         let source_dirs = discover_source_dirs(&root_dir);
 
@@ -186,11 +195,20 @@ impl AppContext {
 
         let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
 
+        // `0` is the documented escape hatch that turns the deadline off: a pull
+        // or a followed log stream may legitimately outlive any fixed bound.
+        let timeout = if timeout_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(timeout_secs))
+        };
+
         Ok(Self {
             source_dirs,
             target_dir,
             user,
             dry_run,
+            timeout,
         })
     }
 
@@ -326,7 +344,7 @@ async fn uninstall(ctx: &AppContext) -> Result<()> {
             if ctx.dry_run {
                 println!("DRY-RUN systemctl --user stop {}", systemd_unit(&stem));
             } else {
-                match systemctl_user("stop", &stem).await {
+                match systemctl_user("stop", &stem, ctx.timeout).await {
                     Ok(()) => debug!("Stopped {stem} (if running)"),
                     Err(err) => warn!("failed to stop {stem} (continuing): {err:#}"),
                 }
@@ -359,7 +377,7 @@ async fn reinstall(ctx: &AppContext) -> Result<()> {
 async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
     ensure_service_known(ctx, &service).await?;
     let requested = service.is_some();
-    let targets = resolve_targets(ctx, service).await?;
+    let targets = resolve_targets(ctx, service, TargetScope::Project).await?;
 
     if requested {
         // `start <service>` installs only the requested unit, never the whole
@@ -390,10 +408,11 @@ async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
 
         println!("Starting {unit}");
         let unit_for_task = unit.clone();
+        let timeout = ctx.timeout;
         handles.push((
             unit,
             tokio::spawn(async move {
-                systemctl_user("start", &unit_for_task).await?;
+                systemctl_user("start", &unit_for_task, timeout).await?;
                 debug!("Started {unit_for_task}");
                 Ok::<(), anyhow::Error>(())
             }),
@@ -502,7 +521,7 @@ async fn missing_targets(ctx: &AppContext, targets: &[String]) -> Result<Vec<Str
 
 async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
     ensure_service_known(ctx, &service).await?;
-    let targets = resolve_targets(ctx, service).await?;
+    let targets = resolve_targets(ctx, service, TargetScope::Project).await?;
     let mut handles = Vec::new();
     for unit in targets {
         if ctx.dry_run {
@@ -517,10 +536,11 @@ async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
         }
 
         let unit_for_task = unit.clone();
+        let timeout = ctx.timeout;
         handles.push((
             unit,
             tokio::spawn(async move {
-                systemctl_user("stop", &unit_for_task).await?;
+                systemctl_user("stop", &unit_for_task, timeout).await?;
                 debug!("Stopped {unit_for_task}");
                 Ok::<(), anyhow::Error>(())
             }),
@@ -532,7 +552,7 @@ async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
 
 async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
     ensure_service_known(ctx, &service).await?;
-    let targets = resolve_targets(ctx, service).await?;
+    let targets = resolve_targets(ctx, service, TargetScope::Project).await?;
     let mut handles = Vec::new();
     for unit in targets {
         if ctx.dry_run {
@@ -547,10 +567,11 @@ async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
         }
 
         let unit_for_task = unit.clone();
+        let timeout = ctx.timeout;
         handles.push((
             unit,
             tokio::spawn(async move {
-                systemctl_user("restart", &unit_for_task).await?;
+                systemctl_user("restart", &unit_for_task, timeout).await?;
                 debug!("Restarted {unit_for_task}");
                 Ok::<(), anyhow::Error>(())
             }),
@@ -627,7 +648,7 @@ async fn update(ctx: &AppContext, service: Option<String>) -> Result<()> {
             continue;
         }
 
-        match run_command("podman", &["pull", &image], false).await {
+        match run_command("podman", &["pull", &image], false, None).await {
             Ok(()) => {
                 println!("Updated {unit}");
                 pulled += 1;
@@ -676,8 +697,13 @@ async fn update(ctx: &AppContext, service: Option<String>) -> Result<()> {
     )
 }
 
-async fn status(ctx: &AppContext, service: Option<String>, compact: bool) -> Result<()> {
-    let targets = resolve_targets(ctx, service).await?;
+async fn status(
+    ctx: &AppContext,
+    service: Option<String>,
+    compact: bool,
+    scope: TargetScope,
+) -> Result<()> {
+    let targets = resolve_targets(ctx, service, scope).await?;
 
     if targets.is_empty() {
         println!("No container units found in {}", ctx.source_display());
@@ -706,7 +732,13 @@ async fn status(ctx: &AppContext, service: Option<String>, compact: bool) -> Res
     for (index, unit) in targets.iter().enumerate() {
         let linked = path_exists(&ctx.target_dir.join(format!("{unit}.container"))).await?;
         let running = if linked {
-            is_active(unit).await.unwrap_or(false)
+            match is_active(unit, ctx.timeout).await {
+                Ok(running) => running,
+                Err(err) => {
+                    tracing::warn!("could not query state of {unit}: {err:#}");
+                    false
+                }
+            }
         } else {
             false
         };
@@ -837,7 +869,7 @@ async fn menu(ctx: &AppContext, service: Option<String>) -> Result<()> {
                 print!("\x1B[2J\x1B[H");
                 println!("Recent logs for {}", row.unit);
                 println!();
-                recent_logs(&row.unit).await
+                recent_logs(&row.unit, ctx.timeout).await
             }
             other => {
                 println!("Unknown action: {other}");
@@ -864,13 +896,19 @@ struct ServiceRow {
 }
 
 async fn service_rows(ctx: &AppContext, service: Option<String>) -> Result<Vec<ServiceRow>> {
-    let targets = resolve_targets(ctx, service).await?;
+    let targets = resolve_targets(ctx, service, TargetScope::Wide).await?;
     let mut rows = Vec::with_capacity(targets.len());
 
     for unit in targets {
         let linked = path_exists(&ctx.target_dir.join(format!("{unit}.container"))).await?;
         let running = if linked {
-            is_active(&unit).await.unwrap_or(false)
+            match is_active(&unit, ctx.timeout).await {
+                Ok(running) => running,
+                Err(err) => {
+                    tracing::warn!("could not query state of {unit}: {err:#}");
+                    false
+                }
+            }
         } else {
             false
         };
@@ -1010,7 +1048,13 @@ async fn clean_volumes(ctx: &AppContext, yes: bool) -> Result<()> {
     }
 
     for volume_name in volume_names {
-        run_command("podman", &["volume", "rm", "-f", &volume_name], false).await?;
+        run_command(
+            "podman",
+            &["volume", "rm", "-f", &volume_name],
+            false,
+            ctx.timeout,
+        )
+        .await?;
         debug!("Removed volume: {volume_name}");
     }
 
@@ -1039,6 +1083,7 @@ async fn check_quadlet(ctx: &AppContext, quadlet: String) -> Result<()> {
         "/usr/lib/podman/quadlet",
         &["-dryrun", "-user", &ctx.user, &quadlet],
         false,
+        ctx.timeout,
     )
     .await?;
     Ok(())
@@ -1046,12 +1091,23 @@ async fn check_quadlet(ctx: &AppContext, quadlet: String) -> Result<()> {
 
 async fn logs(service: String, extra: bool) -> Result<()> {
     let unit = systemd_unit(&service);
+    // `--no-pager` goes last on purpose: a followed stream must not hand the
+    // terminal over to a pager that would keep `qctl` alive after journalctl
+    // writes nothing more to follow.
     if extra {
-        run_command_streaming("journalctl", &["--user", "-xsfu", &unit]).await?;
+        run_command_streaming("journalctl", &["--user", "-xsfu", &unit, "--no-pager"]).await?;
     } else {
         run_command_streaming(
             "journalctl",
-            &["--user", "-u", &unit, "-f", "--since", "1 hour ago"],
+            &[
+                "--user",
+                "-u",
+                &unit,
+                "-f",
+                "--since",
+                "1 hour ago",
+                "--no-pager",
+            ],
         )
         .await?;
     }
@@ -1059,7 +1115,7 @@ async fn logs(service: String, extra: bool) -> Result<()> {
     Ok(())
 }
 
-async fn recent_logs(service: &str) -> Result<()> {
+async fn recent_logs(service: &str, timeout: Option<Duration>) -> Result<()> {
     let unit = systemd_unit(service);
     run_command(
         "journalctl",
@@ -1074,6 +1130,7 @@ async fn recent_logs(service: &str) -> Result<()> {
             "--no-pager",
         ],
         true,
+        timeout,
     )
     .await
 }
@@ -1115,7 +1172,20 @@ async fn ensure_service_known(ctx: &AppContext, service: &Option<String>) -> Res
     Ok(())
 }
 
-async fn resolve_targets(ctx: &AppContext, service: Option<String>) -> Result<Vec<String>> {
+/// How far `resolve_targets` looks when no service was named.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetScope {
+    /// Only the current project's quadlets (the source dirs).
+    Project,
+    /// The whole target directory as well, to show what any project has installed.
+    Wide,
+}
+
+async fn resolve_targets(
+    ctx: &AppContext,
+    service: Option<String>,
+    scope: TargetScope,
+) -> Result<Vec<String>> {
     if let Some(svc) = service {
         return Ok(vec![strip_dot_extension(&svc)]);
     }
@@ -1128,7 +1198,7 @@ async fn resolve_targets(ctx: &AppContext, service: Option<String>) -> Result<Ve
         }
     }
 
-    if path_exists(&ctx.target_dir).await? {
+    if scope == TargetScope::Wide && path_exists(&ctx.target_dir).await? {
         let installed_files = collect_quadlets(std::slice::from_ref(&ctx.target_dir)).await?;
         for path in installed_files {
             if extension_of_path(&path) == Some("container") {
@@ -1297,22 +1367,34 @@ async fn daemon_reload(ctx: &AppContext) -> Result<()> {
         return Ok(());
     }
 
-    run_command("systemctl", &["--user", "daemon-reload"], false).await
+    run_command(
+        "systemctl",
+        &["--user", "daemon-reload"],
+        false,
+        ctx.timeout,
+    )
+    .await
 }
 
-async fn is_active(unit: &str) -> Result<bool> {
+/// Reports whether the systemd user unit is active.
+///
+/// Like every other bounded external call this spawns with `kill_on_drop` and
+/// honours the shared deadline, so a wedged `systemctl` cannot hang the status
+/// table forever.
+async fn is_active(unit: &str, timeout: Option<Duration>) -> Result<bool> {
     let unit = systemd_unit(unit);
-    let output = Command::new("systemctl")
-        .args(["--user", "is-active", &unit])
-        .output()
-        .await
-        .context("failed to execute systemctl")?;
+    let args = ["--user", "is-active", unit.as_str()];
+
+    let mut command = Command::new("systemctl");
+    command.args(args).kill_on_drop(true);
+
+    let output = await_command(command.output(), timeout, "systemctl", &args).await?;
     Ok(String::from_utf8_lossy(&output.stdout).trim() == "active")
 }
 
-async fn systemctl_user(action: &str, unit: &str) -> Result<()> {
+async fn systemctl_user(action: &str, unit: &str, timeout: Option<Duration>) -> Result<()> {
     let unit = systemd_unit(unit);
-    run_command("systemctl", &["--user", action, &unit], false).await
+    run_command("systemctl", &["--user", action, &unit], false, timeout).await
 }
 
 fn systemd_unit(unit: &str) -> String {
@@ -1323,16 +1405,51 @@ fn systemd_unit(unit: &str) -> String {
     }
 }
 
-async fn run_command(cmd: &str, args: &[&str], allow_failure: bool) -> Result<()> {
+/// Waits for a spawned child, applying `timeout` when it is set.
+///
+/// `None` waits without limit. On expiry the error names the command together
+/// with its arguments — via `format_command`, so the failing unit or file is
+/// part of the message — and the caller's `kill_on_drop` child is dropped, which
+/// terminates the direct child. Processes that child may have forked are not
+/// reaped.
+async fn await_command<T, F>(
+    future: F,
+    timeout: Option<Duration>,
+    cmd: &str,
+    args: &[&str],
+) -> Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    let Some(limit) = timeout else {
+        return future
+            .await
+            .with_context(|| format!("failed to execute {cmd}"));
+    };
+
+    match tokio::time::timeout(limit, future).await {
+        Ok(result) => result.with_context(|| format!("failed to execute {cmd}")),
+        Err(_) => bail!(
+            "command timed out after {}s: {}",
+            limit.as_secs(),
+            format_command(cmd, args)
+        ),
+    }
+}
+
+async fn run_command(
+    cmd: &str,
+    args: &[&str],
+    allow_failure: bool,
+    timeout: Option<Duration>,
+) -> Result<()> {
     debug!("Running command: {} {}", cmd, args.join(" "));
 
     if allow_failure {
-        let status = Command::new(cmd)
-            .args(args)
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .with_context(|| format!("failed to execute {cmd}"))?;
+        let mut command = Command::new(cmd);
+        command.args(args).stderr(Stdio::null()).kill_on_drop(true);
+
+        let status = await_command(command.status(), timeout, cmd, args).await?;
 
         if !status.success() {
             debug!("Allowed command failure: {}", format_command(cmd, args));
@@ -1341,11 +1458,10 @@ async fn run_command(cmd: &str, args: &[&str], allow_failure: bool) -> Result<()
         return Ok(());
     }
 
-    let output = Command::new(cmd)
-        .args(args)
-        .output()
-        .await
-        .with_context(|| format!("failed to execute {cmd}"))?;
+    let mut command = Command::new(cmd);
+    command.args(args).kill_on_drop(true);
+
+    let output = await_command(command.output(), timeout, cmd, args).await?;
 
     if !output.stdout.is_empty() {
         print!("{}", String::from_utf8_lossy(&output.stdout));

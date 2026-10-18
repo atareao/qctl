@@ -607,6 +607,10 @@ fn logsf_uses_extra_journalctl_flags() {
         logged.contains("--user -xsfu voicebox.service"),
         "logsf must pass extra flags: {logged}"
     );
+    assert!(
+        logged.contains("--no-pager"),
+        "logsf must not hand the terminal over to a pager: {logged}"
+    );
 }
 
 #[test]
@@ -633,6 +637,10 @@ fn logs_uses_plain_journalctl_flags() {
     assert!(
         logged.contains("--user -u voicebox.service -f --since 1 hour ago"),
         "logs must pass plain flags: {logged}"
+    );
+    assert!(
+        logged.contains("--no-pager"),
+        "logs must not hand the terminal over to a pager: {logged}"
     );
 }
 
@@ -1301,5 +1309,380 @@ fn start_without_arguments_starts_units_in_target_subdirs() {
         symlinks_under(&target).is_empty(),
         "start must not create any symlink inside the target dir: {:?}",
         symlinks_under(&target)
+    );
+}
+
+/// Runs qctl with a fake `PATH` and closed stdin, killing it (and returning
+/// `None`) if it outlives `timeout`, so a suite exercising external timeouts
+/// can never hang the runner.
+fn run_qctl_with_path_and_timeout(
+    home: &Path,
+    cwd: &Path,
+    path: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<Output> {
+    let child = Command::new(env!("CARGO_BIN_EXE_qctl"))
+        .args(args)
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("USER", "qctl-test")
+        .env_remove("RUST_LOG")
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn qctl");
+
+    wait_with_timeout(child, timeout)
+}
+
+fn fake_slow_systemctl(bin: &Path, log: &Path) {
+    let script = format!(
+        "#!/bin/sh\necho \"$@\" >> {}\nsleep 3\nexit 0\n",
+        log.display()
+    );
+    let systemctl = bin.join("systemctl");
+    write_file(&systemctl, &script);
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755))
+        .expect("failed to chmod fake systemctl");
+}
+
+fn fake_slow_podman(bin: &Path, log: &Path) {
+    let script = format!(
+        "#!/bin/sh\necho \"$@\" >> {}\nsleep 3\nexit 0\n",
+        log.display()
+    );
+    let podman = bin.join("podman");
+    write_file(&podman, &script);
+    fs::set_permissions(&podman, fs::Permissions::from_mode(0o755))
+        .expect("failed to chmod fake podman");
+}
+
+fn fake_slow_journalctl(bin: &Path, log: &Path) {
+    let script = format!(
+        "#!/bin/sh\necho \"$@\" >> {}\nsleep 3\nexit 0\n",
+        log.display()
+    );
+    let journalctl = bin.join("journalctl");
+    write_file(&journalctl, &script);
+    fs::set_permissions(&journalctl, fs::Permissions::from_mode(0o755))
+        .expect("failed to chmod fake journalctl");
+}
+
+/// Layout shared by the local-scope tests: two projects, each owning one
+/// container quadlet, both linked into the same target dir.
+///
+/// The unit names are deliberately distinguishable (`alpha` vs `bravo`) so a
+/// test can assert on a substring without matching the wrong unit, and the
+/// second project is only ever reached through the target dir — which is what
+/// makes it a witness for an over-wide resolution scope.
+struct LocalScopeLayout {
+    home: PathBuf,
+    proj_a: PathBuf,
+    bin: PathBuf,
+    log: PathBuf,
+}
+
+impl LocalScopeLayout {
+    fn new(root: &Path, image: &str) -> Self {
+        let home = root.join("home");
+        let proj_a = root.join("projA");
+        let proj_b = root.join("projB");
+        let bin = root.join("bin");
+        let log = root.join("systemctl.log");
+        let target = home.join(".config").join("containers").join("systemd");
+
+        fs::create_dir_all(&target).expect("failed to create target dir");
+        fs::create_dir_all(&proj_a).expect("failed to create projA");
+        fs::create_dir_all(&proj_b).expect("failed to create projB");
+        fs::create_dir_all(&bin).expect("failed to create bin");
+
+        let content = format!("[Container]\nImage={image}\n");
+        for (project, unit) in [(&proj_a, "alpha"), (&proj_b, "bravo")] {
+            let source = project.join(format!("{unit}.container"));
+            write_file(&source, &content);
+            symlink(&source, target.join(format!("{unit}.container")))
+                .expect("failed to create test symlink");
+        }
+
+        Self {
+            home,
+            proj_a,
+            bin,
+            log,
+        }
+    }
+
+    fn path(&self) -> String {
+        prepend_path(&self.bin)
+    }
+
+    fn logged(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+#[test]
+fn stop_without_arguments_does_not_stop_other_project_units() {
+    let root = TestDir::new("stop-local-scope");
+    let layout = LocalScopeLayout::new(root.path(), "example");
+    fake_systemctl(&layout.bin, &layout.log);
+
+    let path = layout.path();
+    let output = run_qctl_with_path(&layout.home, &layout.proj_a, Path::new(&path), &["stop"]);
+    assert!(output.status.success(), "stop failed: {output:?}");
+
+    let logged = layout.logged();
+    assert!(
+        logged.contains("--user stop alpha.service"),
+        "stop must stop the current project's unit: {logged}"
+    );
+    assert!(
+        !logged.contains("stop bravo.service"),
+        "stop without arguments must not stop another project's unit: {logged}"
+    );
+}
+
+#[test]
+fn restart_without_arguments_does_not_restart_other_project_units() {
+    let root = TestDir::new("restart-local-scope");
+    let layout = LocalScopeLayout::new(root.path(), "example");
+    fake_systemctl(&layout.bin, &layout.log);
+
+    let path = layout.path();
+    let output = run_qctl_with_path(&layout.home, &layout.proj_a, Path::new(&path), &["restart"]);
+    assert!(output.status.success(), "restart failed: {output:?}");
+
+    let logged = layout.logged();
+    assert!(
+        logged.contains("--user restart alpha.service"),
+        "restart must restart the current project's unit: {logged}"
+    );
+    assert!(
+        !logged.contains("restart bravo.service"),
+        "restart without arguments must not restart another project's unit: {logged}"
+    );
+}
+
+#[test]
+fn start_without_arguments_does_not_start_other_project_units() {
+    let root = TestDir::new("start-local-scope");
+    let layout = LocalScopeLayout::new(root.path(), "example");
+    fake_systemctl(&layout.bin, &layout.log);
+
+    let path = layout.path();
+    let output = run_qctl_with_path(&layout.home, &layout.proj_a, Path::new(&path), &["start"]);
+    assert!(output.status.success(), "start failed: {output:?}");
+
+    let logged = layout.logged();
+    assert!(
+        logged.contains("--user start alpha.service"),
+        "start must start the current project's unit: {logged}"
+    );
+    assert!(
+        !logged.contains("start bravo.service"),
+        "start without arguments must not start another project's unit: {logged}"
+    );
+}
+
+#[test]
+fn stop_table_lists_only_the_current_project() {
+    let root = TestDir::new("stop-table-local-scope");
+    let layout = LocalScopeLayout::new(root.path(), "example");
+    fake_systemctl(&layout.bin, &layout.log);
+
+    let path = layout.path();
+    let output = run_qctl_with_path(&layout.home, &layout.proj_a, Path::new(&path), &["stop"]);
+    assert!(output.status.success(), "stop failed: {output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("alpha"),
+        "the trailing table must list the current project's unit: {stdout}"
+    );
+    assert!(
+        !stdout.contains("bravo"),
+        "the trailing table must not list another project's unit: {stdout}"
+    );
+}
+
+#[test]
+fn status_reports_units_from_every_project() {
+    let root = TestDir::new("status-wide-scope");
+    let layout = LocalScopeLayout::new(root.path(), "example");
+    fake_systemctl(&layout.bin, &layout.log);
+
+    let path = layout.path();
+    let output = run_qctl_with_path(&layout.home, &layout.proj_a, Path::new(&path), &["status"]);
+    assert!(output.status.success(), "status failed: {output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("alpha"),
+        "status must report the current project's unit: {stdout}"
+    );
+    assert!(
+        stdout.contains("bravo"),
+        "status must report units installed from other projects: {stdout}"
+    );
+}
+
+#[test]
+fn stop_with_explicit_name_still_resolves_target_dir() {
+    let root = TestDir::new("stop-explicit-installed");
+    let project = root.path().join("projA");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    let source = project.join("charlie.container");
+    write_file(&source, "[Container]\nImage=example\n");
+
+    let path = prepend_path(&bin);
+    let install = run_qctl_with_path(&home, &project, Path::new(&path), &["install"]);
+    assert!(
+        install.status.success(),
+        "setup install failed: {install:?}"
+    );
+    assert!(is_symlink(&target.join("charlie.container")));
+
+    // The project no longer provides charlie.container, but it stays installed.
+    fs::remove_file(&source).expect("failed to remove project source");
+
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["stop", "charlie"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("no such quadlet"),
+        "stop charlie must accept a unit still present in the target dir: {stderr}"
+    );
+    assert!(output.status.success(), "stop charlie failed: {output:?}");
+}
+
+#[test]
+fn systemctl_timeout_fails_with_unit_and_action() {
+    let root = TestDir::new("timeout-systemctl");
+    let layout = LocalScopeLayout::new(root.path(), "example");
+    fake_slow_systemctl(&layout.bin, &layout.log);
+
+    let path = layout.path();
+    let output = run_qctl_with_path_and_timeout(
+        &layout.home,
+        &layout.proj_a,
+        Path::new(&path),
+        &["--timeout", "1", "stop", "alpha"],
+        Duration::from_secs(20),
+    )
+    .expect("qctl ignored the external timeout and never exited");
+
+    assert!(
+        !output.status.success(),
+        "stop must fail once the unit outlives --timeout: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("alpha"),
+        "the timeout error must name the unit it gave up on: {stderr}"
+    );
+}
+
+#[test]
+fn timeout_zero_disables_the_limit() {
+    let root = TestDir::new("timeout-disabled");
+    let layout = LocalScopeLayout::new(root.path(), "example");
+    fake_slow_systemctl(&layout.bin, &layout.log);
+
+    let path = layout.path();
+    let start = Instant::now();
+    let output = run_qctl_with_path_and_timeout(
+        &layout.home,
+        &layout.proj_a,
+        Path::new(&path),
+        &["--timeout", "0", "stop", "alpha"],
+        Duration::from_secs(20),
+    )
+    .expect("qctl ignored the external timeout and never exited");
+    let elapsed = start.elapsed();
+
+    assert!(
+        output.status.success(),
+        "--timeout 0 must let a slow command finish: {output:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "--timeout 0 must actually wait for the slow command: {elapsed:?}"
+    );
+}
+
+#[test]
+fn podman_pull_is_not_bounded_by_the_timeout() {
+    let root = TestDir::new("timeout-podman");
+    let layout = LocalScopeLayout::new(root.path(), "example.com/alpha");
+    let log = root.path().join("podman.log");
+    fake_slow_podman(&layout.bin, &log);
+
+    let path = layout.path();
+    let output = run_qctl_with_path_and_timeout(
+        &layout.home,
+        &layout.proj_a,
+        Path::new(&path),
+        &["--timeout", "1", "update"],
+        Duration::from_secs(20),
+    )
+    .expect("qctl ignored the external timeout and never exited");
+
+    assert!(
+        output.status.success(),
+        "a slow podman pull must not trip the unit timeout: {output:?}"
+    );
+
+    let logged = fs::read_to_string(&log).expect("missing podman log");
+    assert!(
+        logged.contains("pull example.com/alpha"),
+        "update must pull every Image= it finds: {logged}"
+    );
+}
+
+#[test]
+fn logs_is_not_bounded_by_the_timeout() {
+    let root = TestDir::new("timeout-logs");
+    let layout = LocalScopeLayout::new(root.path(), "example");
+    let log = root.path().join("journalctl.log");
+    fake_slow_journalctl(&layout.bin, &log);
+
+    let path = layout.path();
+    let output = run_qctl_with_path_and_timeout(
+        &layout.home,
+        &layout.proj_a,
+        Path::new(&path),
+        &["--timeout", "1", "logs", "alpha"],
+        Duration::from_secs(20),
+    )
+    .expect("qctl ignored the external timeout and never exited");
+
+    assert!(
+        output.status.success(),
+        "a followed log stream must not trip the unit timeout: {output:?}"
+    );
+
+    let logged = fs::read_to_string(&log).expect("missing journalctl log");
+    assert!(
+        logged.contains("-f"),
+        "logs must still follow the journal: {logged}"
+    );
+}
+
+#[test]
+fn negative_timeout_is_rejected() {
+    let root = TestDir::new("timeout-negative");
+    let output = run_qctl(root.path(), root.path(), &["--timeout", "-1", "status"]);
+
+    assert!(
+        !output.status.success(),
+        "a negative timeout must be rejected: {output:?}"
     );
 }

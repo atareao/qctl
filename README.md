@@ -9,7 +9,7 @@ CLI en Rust para gestionar quadlets de forma simple y segura: instalación de en
 
 ## Características
 
-- Instala y desinstala quadlets encontrados en `./quadlets/` o en el directorio actual.
+- Instala y desinstala quadlets encontrados **en el primer nivel** de `./quadlets/` o del directorio actual. Los subdirectorios no se recorren (ver [Alcance del descubrimiento](#alcance-del-descubrimiento)).
 - Actualiza las imágenes de los contenedores con `podman pull` leyendo el campo `Image=` de cada `.container`.
 - Inicia y detiene servicios de contenedor con `systemctl --user`.
 - `qctl start <servicio>` instala **solo** esa unidad si faltaba y la arranca; `qctl start` sin argumentos instala los quadlets que falten y arranca todos.
@@ -104,6 +104,15 @@ qctl --dry-run clean-volumes
 
 Los comandos de solo consulta (`status`, `logs`, `logsf`, `check`, `completions`) siguen consultando el sistema aunque se use `--dry-run`, porque son de lectura y su utilidad desaparecería al simularlos. `qctl menu --dry-run` también sigue consultando para dibujar la tabla, pero las acciones que mutan (`start`, `stop`, `restart`) respetan `--dry-run`.
 
+`--timeout <SEGUNDOS>` limita las herramientas externas que `qctl` espera: `systemctl --user` (`start`, `stop`, `restart`, `daemon-reload`, `is-active`), `/usr/lib/podman/quadlet` y `podman volume rm`. Por defecto son **60 segundos**; `--timeout 0` desactiva el límite. Al agotarse el plazo, `qctl` termina el proceso y falla con un error que nombra el comando y la unidad.
+
+Dos invocaciones quedan **fuera** del plazo, a propósito:
+
+- `podman pull`: depende de la red y puede tardar legítimamente más que el valor por defecto.
+- `logs` y `logsf`: ejecutan `journalctl` en modo *follow* (`-f`) y deben correr hasta que los interrumpas.
+
+`logs` y `logsf` invocan además `journalctl` con `--no-pager`, para que un paginador configurado en tu sistema no se apodere del terminal de un comando pensado para ser scriptable.
+
 ### Nombres de servicio y seguridad del directorio destino
 
 Los comandos que actúan sobre unidades (`start`, `stop`, `restart`, `update`) validan el nombre antes de tocar nada: si no corresponde a ningún quadlet, fallan con `no such quadlet: <nombre>` y código de salida distinto de cero. Un nombre se acepta si existe `<origen>/<nombre>.container` **o** `<destino>/<nombre>.container`; lo segundo cubre unidades ya instaladas cuyo origen se borró.
@@ -111,6 +120,47 @@ Los comandos que actúan sobre unidades (`start`, `stop`, `restart`, `update`) v
 `status`, `check`, `logs` y `logsf` no validan nombres: son consultas y se limitan a mostrar lo que exista (o el error de `systemctl`).
 
 `qctl` nunca borra ni reemplaza **ficheros regulares** del directorio destino: solo elimina symlinks. Si encuentra un fichero regular con el mismo nombre, avisa por stderr y lo deja intacto. Esto cubre además ejecutar `qctl` desde dentro del propio `$HOME/.config/containers/systemd` (con un `quadlets/` anidado): ya no crea auto-symlinks y se recupera de los que hubieran dejado versiones anteriores.
+
+### Alcance de los comandos de unidad
+
+`start`, `stop` y `restart` **sin argumentos** actúan solo sobre los quadlets del proyecto actual: los que hay en `./quadlets/` y en el directorio de trabajo. No alcanzan las unidades que otros proyectos hayan enlazado en el mismo `$HOME/.config/containers/systemd`. Con dos proyectos enlazados en el mismo `HOME`, `cd proyectoA && qctl stop` no toca los servicios de `proyectoB`. La tabla que estos comandos imprimen al terminar refleja ese mismo conjunto.
+
+`status` y `menu` son consultas y sí muestran **todo** el directorio destino, vengan las unidades del proyecto que vengan, para que veas de un vistazo qué hay instalado en el `HOME`.
+
+Con un nombre explícito nada cambia: `qctl stop <nombre>` se resuelve contra el proyecto y contra el directorio destino, así que una unidad instalada cuyo origen desapareció se sigue pudiendo parar por su nombre.
+
+### Alcance del descubrimiento
+
+`qctl` busca quadlets en dos directorios fuente: `./quadlets/` y el directorio actual. En cada uno de ellos **solo mira el primer nivel**: un `quadlets/web/api.container` o un `quadlets/db/api.container` no se recoge. Los subdirectorios no se recorren.
+
+Esto es una **divergencia consciente** con el runtime de Quadlet. `podman-systemd.unit(5)` documenta que, en los search paths de unidades de usuario, Quadlet "recursively search and run the unit files present in these subdirectories". Esa recursión existe desde Quadlet v4.7.0 (commit `413552e`, jul-2023) y quedó completa en v5.4.0 (ene-2025), cuando se arregló la búsqueda en `/etc/containers/systemd/users/<uid>/` en modo rootless. El directorio destino de `qctl` (`$HOME/.config/containers/systemd`) es uno de esos search paths, así que el runtime **sí** carga un quadlet anidado que `qctl` no ve: `install` no lo enlaza, `start` no lo arranca y `start <nombre>` responde `no such quadlet`. Se decidió mantener el escaneo de un nivel y documentarlo en lugar de hacerlo recursivo.
+
+#### Colisiones de nombre
+
+El nombre de la unidad se deriva del **basename** del fichero, no de su ruta: `web/api.container` y `db/api.container` compiten ambos por `api.service`. Hay dos casos distintos:
+
+- **Dentro del primer nivel**, si `qctl` encuentra dos ficheros distintos con el mismo basename, falla de forma ruidosa: `duplicate quadlet file name '<name>' found in <path> and <path>` y código de salida distinto de cero. Nunca elige uno en silencio.
+- **Entre subdirectorios anidados**, esos ficheros quedan fuera del escaneo de `qctl` y es el propio Quadlet quien resuelve —o no— la colisión. Medido con el generador real (`/usr/lib/podman/quadlet`, podman 6.1.2): con `web/api.container` y `db/api.container` **no emite ningún aviso** y genera un único `api.service`; en esa medición ganó el de `db` y la imagen de `web` se perdió en silencio.
+
+La vía canónica para evitar la colisión es la clave `ServiceName=` en el propio quadlet:
+
+```ini
+# web/api.container
+[Container]
+Image=example.com/web-api
+ServiceName=api-web
+```
+
+```ini
+# db/api.container
+[Container]
+Image=example.com/db-api
+ServiceName=api-db
+```
+
+Con eso el runtime genera `api-web.service` y `api-db.service`, sin colisión. `ServiceName=` está disponible en las secciones `[Container]`, `[Pod]`, `[Network]`, `[Volume]`, `[Build]`, `[Image]` y `[Artifact]`; el nombre no debe incluir la extensión `.service`. No confundir con `ContainerName=`, que cambia el nombre del contenedor de Podman (por defecto `systemd-%N`) y **no** el de la unidad systemd.
+
+**Limitación conocida:** `qctl` resuelve nombre → fichero por basename (`<origen>/<nombre>.container` o `<destino>/<nombre>.container`). Un quadlet con `ServiceName=api-web` sigue llamándose `api.container`, así que `qctl install` lo enlaza y el runtime genera `api-web.service`, pero `qctl start api-web` falla con `no such quadlet: api-web`. Direccionar unidades renombradas exige un cambio de código y queda fuera del alcance de esta versión.
 
 ## Ejemplos
 
@@ -161,7 +211,7 @@ Acciones disponibles:
 - `l número` o `número l`: muestra logs recientes y vuelve al menú
 - `q`: sale del menú
 
-El menú también incluye unidades ya enlazadas en `$HOME/.config/containers/systemd`, aunque se ejecute desde otro directorio.
+El menú también incluye unidades ya enlazadas en `$HOME/.config/containers/systemd`, aunque se ejecute desde otro directorio: es una vista de solo lectura. Actuar sobre una fila concreta es una elección explícita de esa unidad, así que el menú no amplía el alcance de `start`, `stop` y `restart` descrito en [Alcance de los comandos de unidad](#alcance-de-los-comandos-de-unidad).
 
 ## Limpieza de volúmenes
 
