@@ -41,6 +41,6 @@
 - [x] 4.1 `openspec validate scope-unit-commands-and-harden-execution --strict` en verde.
 - [x] 4.2 `cargo test` completo en verde.
 - [x] 4.3 Auditoría con `@rust-reviewer`: cerrar bloqueantes, mayores y menores hasta LISTO PARA MERGE.
-- [ ] 4.4 PR contra `develop`, CI verde, merge y `openspec archive scope-unit-commands-and-harden-execution`.
-- [ ] 4.5 `release/0.4.0` con el ritual de `CONTRIBUTING.md`: bump, PR a `main`, tag `v0.4.0`, GitHub Release y verificación del binario estático y su checksum.
-- [ ] 4.6 Comprobar que no quedan PRs abiertos ni tareas sin marcar.
+- [x] 4.4 PR contra `develop`, CI verde, merge y `openspec archive scope-unit-commands-and-harden-execution`.
+- [x] 4.5 `release/0.4.0` con el ritual de `CONTRIBUTING.md`: bump, PR a `main`, tag `v0.4.0`, GitHub Release y verificación del binario estático y su checksum.
+- [x] 4.6 Comprobar que no quedan PRs abiertos ni tareas sin marcar.
