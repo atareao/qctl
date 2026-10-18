@@ -5,7 +5,7 @@
 ```sh
 cargo build               # debug build
 cargo build --release     # optimized build, single binary
-cargo test                # 27 tests: 6 unit + 21 integration
+cargo test                # 38 tests: 6 unit + 32 integration
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo audit               # dependency advisories (not installed by default)
@@ -18,8 +18,9 @@ Both workflows run on `ubuntu-24.04` with `actions/checkout@v7`. Release builds 
 ## Project structure
 
 - **Single crate, single binary source** — `src/main.rs` is the only source file of the binary: no lib crate, no modules. Unit tests live in `src/main.rs` under `#[cfg(test)]`.
-- **Integration tests** — `tests/cli.rs` (21 tests) drives the compiled binary with fake `systemctl`/`podman`/`journalctl` shims.
-- **Docs** — `docs/AUDIT.md` holds the security audit.
+- **Integration tests** — `tests/cli.rs` (32 tests) drives the compiled binary with fake `systemctl`/`podman`/`journalctl` shims.
+- **Specs** — `openspec/` drives the change flow (spec-driven development): every feature/fix opens a proposal under `openspec/changes/<change>/`, is validated with `openspec validate <change> --strict`, and is archived into `openspec/specs/` with `openspec archive` once the PR is merged.
+- **Docs** — `docs/AUDIT.md` holds the security audit; `CONTRIBUTING.md` covers the branch model, commit style and the feature/release/hotfix procedures.
 - **Entrypoint**: `qctl` CLI defined at `src/main.rs:22` via clap derive.
 
 ## Dependencies

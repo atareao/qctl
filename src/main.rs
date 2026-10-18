@@ -218,7 +218,7 @@ async fn install(ctx: &AppContext) -> Result<()> {
             .with_context(|| format!("failed to create {}", ctx.target_dir.display()))?;
     }
 
-    let target_canon = fs::canonicalize(&ctx.target_dir).await.ok();
+    let target_canon = canonical_target_dir(ctx).await;
     let files = collect_quadlets(&ctx.source_dirs).await?;
     for src in files {
         let name = basename(&src)?;
@@ -229,12 +229,7 @@ async fn install(ctx: &AppContext) -> Result<()> {
             continue;
         }
 
-        if ctx.dry_run {
-            println!("DRY-RUN link {} -> {}", src.display(), dest.display());
-        } else {
-            link_or_replace(&src, &dest).await?;
-        }
-        debug!("Linked {} -> {}", src.display(), dest.display());
+        link_quadlet(ctx, &src, &dest).await?;
     }
 
     daemon_reload(ctx).await?;
@@ -242,9 +237,24 @@ async fn install(ctx: &AppContext) -> Result<()> {
     Ok(())
 }
 
+/// Canonical form of the target directory, when it exists.
+///
+/// `None` means the directory is absent: nothing can live inside it yet, so every
+/// source counts as external and is linked normally. Callers that need to know
+/// whether a source sits *inside* the target tree pass the result to
+/// `source_is_in_target_dir`.
+async fn canonical_target_dir(ctx: &AppContext) -> Option<PathBuf> {
+    fs::canonicalize(&ctx.target_dir).await.ok()
+}
+
 /// Returns true when `src` already lives inside the target directory, comparing
 /// canonical paths rather than string prefixes so symlinked directories and
 /// `..` segments do not fool the check.
+///
+/// The test is ancestry, not direct-parent equality: a quadlet kept in
+/// `target/quadlets/x.container` is *also* already inside the target directory,
+/// and linking it back into `target/` would create a self-referential entry
+/// that the next run reports as a duplicate.
 ///
 /// A failed `canonicalize` (for example a path that vanished mid-scan) yields
 /// `false`: the source is then treated as external and linked normally, which is
@@ -255,10 +265,37 @@ async fn source_is_in_target_dir(src: &Path, target_canon: Option<&Path>) -> boo
     };
 
     let parent = src.parent().unwrap_or_else(|| Path::new("."));
-    let parent_canon = fs::canonicalize(parent).await.ok();
-    parent_canon.as_deref() == Some(target_canon)
+    let Ok(parent_canon) = fs::canonicalize(parent).await else {
+        return false;
+    };
+    parent_canon.starts_with(target_canon)
 }
 
+/// True when `<unit>.container` counts as installed for the target directory:
+/// either an entry directly inside it — the symlink `install` creates, or a
+/// regular file — or a quadlet living one level below the target directory, for
+/// example `<target_dir>/quadlets/<unit>.container`.
+///
+/// `install` deliberately leaves quadlets that already live inside the target
+/// tree unlinked, so commands that act on units must accept them by name instead
+/// of looking only at `<target_dir>/<unit>.container`; otherwise they would
+/// either recreate the redundant self-symlink or silently skip the unit.
+async fn unit_installed_in_target_dir(ctx: &AppContext, unit: &str) -> Result<bool> {
+    let in_target = ctx.target_dir.join(format!("{unit}.container"));
+    if path_exists(&in_target).await? {
+        return Ok(true);
+    }
+
+    let Some(src) = find_source_quadlet(ctx, &format!("{unit}.container")).await? else {
+        return Ok(false);
+    };
+    Ok(source_is_in_target_dir(&src, canonical_target_dir(ctx).await.as_deref()).await)
+}
+
+/// Stops container units and removes their symlinks from the target directory.
+/// Only symlinks are removed: a regular file that merely shares a quadlet name
+/// is warned about on stderr and left untouched (its stop is skipped too),
+/// because such a file does not belong to `qctl`.
 async fn uninstall(ctx: &AppContext) -> Result<()> {
     debug!(
         "Stopping services and removing symlinks from {}",
@@ -272,7 +309,16 @@ async fn uninstall(ctx: &AppContext) -> Result<()> {
         let ext = extension_of(&name);
 
         let target = ctx.target_dir.join(&name);
-        if !path_exists(&target).await? {
+        // Inspect the entry itself (never the file it points to): a regular file
+        // that shadows a quadlet name is not ours to stop or remove.
+        let Ok(meta) = fs::symlink_metadata(&target).await else {
+            continue;
+        };
+        if !meta.file_type().is_symlink() {
+            warn!(
+                "not removing {} (not a symlink); leaving it untouched",
+                target.display()
+            );
             continue;
         }
 
@@ -311,8 +357,20 @@ async fn reinstall(ctx: &AppContext) -> Result<()> {
 }
 
 async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
+    ensure_service_known(ctx, &service).await?;
+    let requested = service.is_some();
     let targets = resolve_targets(ctx, service).await?;
-    if ctx.dry_run {
+
+    if requested {
+        // `start <service>` installs only the requested unit, never the whole
+        // project: link each target whose symlink is missing, one by one.
+        for unit in &targets {
+            let unit_file = ctx.target_dir.join(format!("{unit}.container"));
+            if !path_exists(&unit_file).await? {
+                install_single(ctx, unit).await?;
+            }
+        }
+    } else if ctx.dry_run {
         install_missing_targets(ctx, &targets).await?;
     } else {
         ensure_targets_installed(ctx, &targets).await?;
@@ -325,8 +383,7 @@ async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
             continue;
         }
 
-        let unit_file = ctx.target_dir.join(format!("{unit}.container"));
-        if !path_exists(&unit_file).await? {
+        if !unit_installed_in_target_dir(ctx, &unit).await? {
             debug!("Skipping {unit} (not linked in target dir)");
             continue;
         }
@@ -344,6 +401,68 @@ async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
     }
 
     await_unit_tasks("start", handles).await
+}
+
+/// Links only `<unit>.container` from the project into the target directory,
+/// creating that one symlink and reloading systemd, without touching unrelated
+/// quadlets. Used by `start <service>` so a first run installs exactly what it
+/// starts.
+async fn install_single(ctx: &AppContext, unit: &str) -> Result<()> {
+    let file_name = format!("{unit}.container");
+    let Some(src) = find_source_quadlet(ctx, &file_name).await? else {
+        bail!("no such quadlet: {unit}");
+    };
+
+    // A quadlet that already lives inside the target tree is installed by
+    // definition: `install` does not link it, and `start` must not create the
+    // redundant self-symlink #3 removes either. Check the origin, not the
+    // destination: an existing `<target_dir>/<unit>.container` never reaches
+    // this function, its caller skips it first.
+    if source_is_in_target_dir(&src, canonical_target_dir(ctx).await.as_deref()).await {
+        debug!("{unit} already lives in the target dir; not linking it");
+        return Ok(());
+    }
+
+    let dest = ctx.target_dir.join(&file_name);
+
+    if ctx.dry_run {
+        return link_quadlet(ctx, &src, &dest).await;
+    }
+
+    fs::create_dir_all(&ctx.target_dir)
+        .await
+        .with_context(|| format!("failed to create {}", ctx.target_dir.display()))?;
+
+    link_quadlet(ctx, &src, &dest).await?;
+    daemon_reload(ctx).await
+}
+
+/// Plans or performs the `src -> dest` symlink in one place: under `--dry-run`
+/// it prints the planned link and creates nothing, otherwise it calls
+/// `link_or_replace` and logs the link once created. A pre-existing regular file
+/// is left in place (already warned about by `link_or_replace`), so `install`
+/// and `install_single` share the same stderr contract.
+async fn link_quadlet(ctx: &AppContext, src: &Path, dest: &Path) -> Result<()> {
+    if ctx.dry_run {
+        println!("DRY-RUN link {} -> {}", src.display(), dest.display());
+        return Ok(());
+    }
+
+    if link_or_replace(src, dest).await? {
+        debug!("Linked {} -> {}", src.display(), dest.display());
+    }
+    Ok(())
+}
+
+/// Returns the first `<file_name>` found in a source directory, if any.
+async fn find_source_quadlet(ctx: &AppContext, file_name: &str) -> Result<Option<PathBuf>> {
+    for dir in &ctx.source_dirs {
+        let candidate = dir.join(file_name);
+        if path_exists(&candidate).await? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 async fn ensure_targets_installed(ctx: &AppContext, targets: &[String]) -> Result<()> {
@@ -382,6 +501,7 @@ async fn missing_targets(ctx: &AppContext, targets: &[String]) -> Result<Vec<Str
 }
 
 async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
+    ensure_service_known(ctx, &service).await?;
     let targets = resolve_targets(ctx, service).await?;
     let mut handles = Vec::new();
     for unit in targets {
@@ -411,6 +531,7 @@ async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
 }
 
 async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
+    ensure_service_known(ctx, &service).await?;
     let targets = resolve_targets(ctx, service).await?;
     let mut handles = Vec::new();
     for unit in targets {
@@ -468,6 +589,7 @@ async fn await_unit_tasks(
 }
 
 async fn update(ctx: &AppContext, service: Option<String>) -> Result<()> {
+    ensure_service_known(ctx, &service).await?;
     let files = collect_quadlets(&ctx.source_dirs).await?;
     let containers: Vec<_> = files
         .into_iter()
@@ -968,6 +1090,31 @@ fn discover_source_dirs(root_dir: &Path) -> Vec<PathBuf> {
     source_dirs
 }
 
+/// True when `<unit>.container` exists as a source quadlet or as an entry in the
+/// target directory. The target directory is included so a unit that is already
+/// installed keeps working after its project source disappears: `start`/`stop`
+/// must still recognise it instead of rejecting the name.
+async fn unit_is_known(ctx: &AppContext, unit: &str) -> Result<bool> {
+    let file_name = format!("{unit}.container");
+    if find_source_quadlet(ctx, &file_name).await?.is_some() {
+        return Ok(true);
+    }
+    path_exists(&ctx.target_dir.join(&file_name)).await
+}
+
+/// Rejects a service argument that matches no quadlet, so mutating commands fail
+/// with `no such quadlet: <name>` (non-zero exit) before linking, reloading or
+/// invoking `systemctl`/`podman`. Read-only commands never call this.
+async fn ensure_service_known(ctx: &AppContext, service: &Option<String>) -> Result<()> {
+    if let Some(svc) = service {
+        let unit = strip_dot_extension(svc);
+        if !unit_is_known(ctx, &unit).await? {
+            bail!("no such quadlet: {unit}");
+        }
+    }
+    Ok(())
+}
+
 async fn resolve_targets(ctx: &AppContext, service: Option<String>) -> Result<Vec<String>> {
     if let Some(svc) = service {
         return Ok(vec![strip_dot_extension(&svc)]);
@@ -995,9 +1142,19 @@ async fn resolve_targets(ctx: &AppContext, service: Option<String>) -> Result<Ve
     Ok(out)
 }
 
+/// Collects every quadlet file found in `source_dirs`, keyed by file name.
+///
+/// When the same name shows up twice, the canonical targets are compared: entries
+/// that resolve to the same file (for example a stale self-link left inside the
+/// target directory by an older version) collapse into one, preferring the real
+/// file over the symlink pointing at it. Two *different* files that merely share
+/// a name still fail, so the user has to disambiguate instead of `qctl` silently
+/// picking one.
 async fn collect_quadlets(source_dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    let mut seen = HashMap::new();
+    // Each entry keeps its path and whether it is a symlink, so a collision can
+    // be resolved by canonical target and the real file preferred.
+    let mut out: Vec<(PathBuf, bool)> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
 
     for source_dir in source_dirs {
         let mut entries = fs::read_dir(source_dir)
@@ -1014,25 +1171,57 @@ async fn collect_quadlets(source_dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
             }
 
             let name = basename(&path)?;
-            if let Some(previous) = seen.insert(name.clone(), path.clone()) {
+            let is_symlink = entry.file_type().await?.is_symlink();
+
+            if let Some(&index) = seen.get(&name) {
+                let same_file = {
+                    let previous = &out[index].0;
+                    let previous_canon = fs::canonicalize(previous).await.ok();
+                    let new_canon = fs::canonicalize(&path).await.ok();
+                    previous_canon.is_some() && previous_canon == new_canon
+                };
+
+                if same_file {
+                    // The same file reached twice (for example a stale self-link
+                    // left by an older version): collapse to a single entry,
+                    // keeping the real file over the symlink pointing at it.
+                    let previous_is_symlink = out[index].1;
+                    if previous_is_symlink && !is_symlink {
+                        out[index] = (path, is_symlink);
+                    }
+                    continue;
+                }
+
                 return Err(anyhow!(
                     "duplicate quadlet file name '{}' found in {} and {}",
                     name,
-                    previous.display(),
+                    out[index].0.display(),
                     path.display()
                 ));
             }
 
-            out.push(path);
+            seen.insert(name, out.len());
+            out.push((path, is_symlink));
         }
     }
 
-    out.sort();
-    Ok(out)
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out.into_iter().map(|(path, _)| path).collect())
 }
 
-async fn link_or_replace(src: &Path, dest: &Path) -> Result<()> {
-    if path_exists(dest).await? {
+/// Creates `dest` as a symlink to `src`. An existing symlink is replaced, but a
+/// regular file (or any other non-symlink entry) is never overwritten: the link
+/// is skipped, a warning goes to stderr and `false` is returned. Returns `true`
+/// when a link was created.
+async fn link_or_replace(src: &Path, dest: &Path) -> Result<bool> {
+    if let Ok(meta) = fs::symlink_metadata(dest).await {
+        if !meta.file_type().is_symlink() {
+            warn!(
+                "not replacing {} (not a symlink); leaving it untouched",
+                dest.display()
+            );
+            return Ok(false);
+        }
         fs::remove_file(dest)
             .await
             .with_context(|| format!("failed to remove existing {}", dest.display()))?;
@@ -1053,7 +1242,7 @@ async fn link_or_replace(src: &Path, dest: &Path) -> Result<()> {
             )
         })?;
 
-    Ok(())
+    Ok(true)
 }
 
 async fn path_exists(path: &Path) -> Result<bool> {

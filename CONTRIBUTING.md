@@ -89,6 +89,7 @@ Tres detalles que se olvidan:
 1. **`.vampus.yml` es la fuente de verdad de la versión.** Se edita `current_version` ahí y la herramienta propaga el valor a `Cargo.toml` según el patrón declarado en `replaces`. No cambies la versión solo en `Cargo.toml`, o el siguiente bump la pisará.
 2. **`release finish` crea el tag y hace merge-back a `develop`.** El merge-back es obligatorio: sin él `develop` se queda por detrás de `main` y el siguiente release arrastra commits fantasma o conflictos artificiales.
 3. **Crear el GitHub Release dispara [`release.yml`](.github/workflows/release.yml).** Compila el binario estático para `x86_64-unknown-linux-musl`, genera el `.sha256` y sube los assets. Comprueba que el workflow termina en verde antes de dar la versión por publicada.
+4. **Si `release finish` aborta con `Branches 'main' and 'origin/main' have diverged`**, es que `main` local se quedó desfasado tras el merge del PR. Se arregla con `git fetch origin main:main` y repitiendo el `finish`.
 
 ## Flujo de hotfix
 

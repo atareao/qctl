@@ -196,6 +196,37 @@ exit 0
         .expect("failed to chmod fake systemctl");
 }
 
+/// Returns true when `path` is a symlink, inspected without following it (so a
+/// broken link still counts).
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// Recursively collects every symlink under `root` without following any of
+/// them, so a test can prove a command left no stray links inside the target
+/// directory.
+fn symlinks_under(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            found.push(path);
+        } else if meta.is_dir() {
+            found.extend(symlinks_under(&path));
+        }
+    }
+    found.sort();
+    found
+}
+
 #[test]
 fn version_flag_reports_crate_version() {
     let root = TestDir::new("version");
@@ -873,5 +904,402 @@ fn install_skips_quadlets_already_in_target_dir() {
     assert!(
         stdout.contains("Skipping voicebox.container (already in target dir)"),
         "{stdout}"
+    );
+}
+
+#[test]
+fn install_skips_quadlets_in_subdirectories_of_target_dir() {
+    let root = TestDir::new("install-subdir-of-target");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let nested = target.join("quadlets");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&nested).expect("failed to create nested target dir");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    write_file(
+        &nested.join("other.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let path = prepend_path(&bin);
+    let first = run_qctl_with_path(&home, &target, Path::new(&path), &["install"]);
+    assert!(first.status.success(), "first install failed: {first:?}");
+
+    let first_out = String::from_utf8_lossy(&first.stdout);
+    assert!(
+        first_out.contains("Skipping other.container (already in target dir)"),
+        "install must report the nested quadlet it skips: {first_out}"
+    );
+
+    // A quadlet living in a subdirectory of the target dir is already
+    // installed: nothing may be linked into the target dir itself.
+    assert!(
+        !target.join("other.container").exists(),
+        "install must not link a quadlet that already lives inside the target dir"
+    );
+    assert!(
+        symlinks_under(&target).is_empty(),
+        "install must not create any symlink inside the target dir: {:?}",
+        symlinks_under(&target)
+    );
+
+    let second = run_qctl_with_path(&home, &target, Path::new(&path), &["install"]);
+    let second_err = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        second.status.success(),
+        "second install must succeed instead of hitting a duplicate: {second:?}"
+    );
+    assert!(
+        !second_err.contains("duplicate quadlet file name"),
+        "second install reported a duplicate: {second_err}"
+    );
+}
+
+#[test]
+fn install_recovers_from_stale_self_link() {
+    let root = TestDir::new("install-stale-self-link");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let nested = target.join("quadlets");
+    let link = target.join("other.container");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&nested).expect("failed to create nested target dir");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    write_file(
+        &nested.join("other.container"),
+        "[Container]\nImage=example\n",
+    );
+    // Reproduce the state older versions left behind: a link inside the target
+    // dir resolving to a file that already lives inside the target dir.
+    symlink(Path::new("quadlets/other.container"), &link)
+        .expect("failed to create stale self link");
+    assert!(is_symlink(&link), "setup must leave a symlink behind");
+
+    let path = prepend_path(&bin);
+    let install = run_qctl_with_path(&home, &target, Path::new(&path), &["install"]);
+    let install_err = String::from_utf8_lossy(&install.stderr);
+    assert!(
+        install.status.success(),
+        "install must recover from a stale self link: {install:?}"
+    );
+    assert!(
+        !install_err.contains("duplicate quadlet file name"),
+        "install reported a duplicate: {install_err}"
+    );
+
+    let uninstall = run_qctl_with_path(&home, &target, Path::new(&path), &["uninstall"]);
+    let uninstall_err = String::from_utf8_lossy(&uninstall.stderr);
+    assert!(
+        uninstall.status.success(),
+        "uninstall must recover from a stale self link: {uninstall:?}"
+    );
+    assert!(
+        !uninstall_err.contains("duplicate quadlet file name"),
+        "uninstall reported a duplicate: {uninstall_err}"
+    );
+    assert!(
+        fs::symlink_metadata(&link).is_err(),
+        "uninstall must remove the stale self link"
+    );
+}
+
+#[test]
+fn uninstall_preserves_regular_files_in_target_dir() {
+    let root = TestDir::new("uninstall-regular-file");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&target).expect("failed to create target dir");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    let file = target.join("one.container");
+    write_file(&file, "[Container]\nImage=sentinel\n");
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &target, Path::new(&path), &["uninstall"]);
+    assert!(output.status.success(), "uninstall failed: {output:?}");
+
+    assert!(
+        !is_symlink(&file),
+        "uninstall must not turn a regular file into a symlink"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).expect("uninstall must leave a regular file in the target dir"),
+        "[Container]\nImage=sentinel\n"
+    );
+}
+
+#[test]
+fn install_does_not_replace_regular_file_in_target_dir() {
+    let root = TestDir::new("install-regular-file");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    write_file(&project.join("one.container"), "[Container]\nImage=one\n");
+    write_file(&project.join("two.container"), "[Container]\nImage=two\n");
+    let sentinel = "[Container]\nImage=keep-me\n";
+    write_file(&target.join("one.container"), sentinel);
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["install"]);
+    assert!(output.status.success(), "install failed: {output:?}");
+
+    let shadowed = target.join("one.container");
+    assert!(
+        !is_symlink(&shadowed),
+        "install must not replace a regular file with a symlink"
+    );
+    assert_eq!(
+        fs::read_to_string(&shadowed).expect("regular file must survive install"),
+        sentinel
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("one.container") && stderr.to_lowercase().contains("symlink"),
+        "install must warn on stderr that one.container is not a symlink: {stderr}"
+    );
+
+    let linked = target.join("two.container");
+    assert!(is_symlink(&linked), "install must still link two.container");
+    assert_eq!(
+        fs::read_link(&linked).expect("two.container must be a symlink"),
+        project.join("two.container")
+    );
+}
+
+#[test]
+fn start_unknown_service_fails_without_installing() {
+    let root = TestDir::new("start-unknown");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&home).expect("failed to create home");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    write_file(&project.join("one.container"), "[Container]\nImage=one\n");
+    write_file(&project.join("two.container"), "[Container]\nImage=two\n");
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["start", "typo"]);
+    assert!(!output.status.success(), "start typo must fail: {output:?}");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no such quadlet: typo"),
+        "start must name the unknown quadlet: {stderr}"
+    );
+
+    assert!(
+        !target.join("one.container").exists() && !target.join("two.container").exists(),
+        "start typo must not install any quadlet"
+    );
+    let logged = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        logged.is_empty(),
+        "start typo must not invoke systemctl: {logged}"
+    );
+}
+
+#[test]
+fn stop_and_restart_unknown_service_fail() {
+    let root = TestDir::new("stop-restart-unknown");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&home).expect("failed to create home");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    write_file(&project.join("one.container"), "[Container]\nImage=one\n");
+
+    let path = prepend_path(&bin);
+    for action in ["stop", "restart"] {
+        let output = run_qctl_with_path(&home, &project, Path::new(&path), &[action, "typo"]);
+        assert!(
+            !output.status.success(),
+            "{action} typo must fail: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("no such quadlet: typo"),
+            "{action} must name the unknown quadlet: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn update_unknown_service_fails() {
+    let root = TestDir::new("update-unknown");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&home).expect("failed to create home");
+    write_file(&project.join("one.container"), "[Container]\nImage=one\n");
+
+    let output = run_qctl(&home, &project, &["update", "typo"]);
+    assert!(
+        !output.status.success(),
+        "update typo must fail: {output:?}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no such quadlet: typo"),
+        "update must name the unknown quadlet: {stderr}"
+    );
+}
+
+#[test]
+fn start_service_links_only_that_unit() {
+    let root = TestDir::new("start-one-unit");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&home).expect("failed to create home");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    write_file(&project.join("one.container"), "[Container]\nImage=one\n");
+    write_file(&project.join("two.container"), "[Container]\nImage=two\n");
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["start", "one"]);
+    assert!(output.status.success(), "start one failed: {output:?}");
+
+    let linked = target.join("one.container");
+    assert!(is_symlink(&linked), "start one must link one.container");
+    assert_eq!(
+        fs::read_link(&linked).expect("one.container must be a symlink"),
+        project.join("one.container")
+    );
+    assert!(
+        !target.join("two.container").exists(),
+        "start one must not install unrelated quadlets"
+    );
+}
+
+#[test]
+fn installed_unit_survives_missing_source() {
+    let root = TestDir::new("installed-missing-source");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    let source = project.join("svc.container");
+    write_file(&source, "[Container]\nImage=svc\n");
+
+    let path = prepend_path(&bin);
+    let install = run_qctl_with_path(&home, &project, Path::new(&path), &["install"]);
+    assert!(
+        install.status.success(),
+        "setup install failed: {install:?}"
+    );
+    assert!(is_symlink(&target.join("svc.container")));
+
+    // The project no longer provides svc.container, but it is installed.
+    fs::remove_file(&source).expect("failed to remove project source");
+
+    for action in ["start", "stop"] {
+        let output = run_qctl_with_path(&home, &project, Path::new(&path), &[action, "svc"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("no such quadlet"),
+            "{action} svc must accept a unit still present in the target dir: {stderr}"
+        );
+        assert!(
+            output.status.success(),
+            "{action} svc must succeed: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn start_service_already_in_target_dir_links_nothing() {
+    let root = TestDir::new("start-single-in-target");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let nested = target.join("quadlets");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&nested).expect("failed to create nested target dir");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    write_file(
+        &nested.join("other.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &target, Path::new(&path), &["start", "other"]);
+    assert!(output.status.success(), "start other failed: {output:?}");
+
+    let logged = fs::read_to_string(&log).expect("missing systemctl log");
+    assert!(
+        logged.contains("--user start other.service"),
+        "start other must start the unit that lives in a target subdirectory: {logged}"
+    );
+
+    assert!(
+        fs::symlink_metadata(target.join("other.container")).is_err(),
+        "start other must not create an entry for a quadlet already in the target dir"
+    );
+    assert!(
+        symlinks_under(&target).is_empty(),
+        "start other must not create any symlink inside the target dir: {:?}",
+        symlinks_under(&target)
+    );
+}
+
+#[test]
+fn start_without_arguments_starts_units_in_target_subdirs() {
+    let root = TestDir::new("start-subdir-of-target");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let nested = target.join("quadlets");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&nested).expect("failed to create nested target dir");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    write_file(
+        &nested.join("other.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &target, Path::new(&path), &["start"]);
+    assert!(output.status.success(), "start must succeed: {output:?}");
+
+    let logged = fs::read_to_string(&log).expect("missing systemctl log");
+    assert!(
+        logged.contains("--user start other.service"),
+        "start without arguments must start a unit living in a target subdirectory: {logged}"
+    );
+    assert!(
+        symlinks_under(&target).is_empty(),
+        "start must not create any symlink inside the target dir: {:?}",
+        symlinks_under(&target)
     );
 }
