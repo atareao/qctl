@@ -12,7 +12,7 @@ CLI en Rust para gestionar quadlets de forma simple y segura: instalación de en
 - Instala y desinstala quadlets encontrados en `./quadlets/` o en el directorio actual.
 - Actualiza las imágenes de los contenedores con `podman pull` leyendo el campo `Image=` de cada `.container`.
 - Inicia y detiene servicios de contenedor con `systemctl --user`.
-- Si ejecutas `qctl start` sin haber instalado antes, instala los quadlets necesarios y luego arranca el servicio.
+- `qctl start <servicio>` instala **solo** esa unidad si faltaba y la arranca; `qctl start` sin argumentos instala los quadlets que falten y arranca todos.
 - Muestra estado en formato visual (tabla) o compacto (ideal para scripts).
 - Limpia volúmenes de Podman declarados en archivos `.volume`.
 - Ejecuta verificación de quadlets con `/usr/lib/podman/quadlet`.
@@ -104,6 +104,14 @@ qctl --dry-run clean-volumes
 
 Los comandos de solo consulta (`status`, `logs`, `logsf`, `check`, `completions`) siguen consultando el sistema aunque se use `--dry-run`, porque son de lectura y su utilidad desaparecería al simularlos. `qctl menu --dry-run` también sigue consultando para dibujar la tabla, pero las acciones que mutan (`start`, `stop`, `restart`) respetan `--dry-run`.
 
+### Nombres de servicio y seguridad del directorio destino
+
+Los comandos que actúan sobre unidades (`start`, `stop`, `restart`, `update`) validan el nombre antes de tocar nada: si no corresponde a ningún quadlet, fallan con `no such quadlet: <nombre>` y código de salida distinto de cero. Un nombre se acepta si existe `<origen>/<nombre>.container` **o** `<destino>/<nombre>.container`; lo segundo cubre unidades ya instaladas cuyo origen se borró.
+
+`status`, `check`, `logs` y `logsf` no validan nombres: son consultas y se limitan a mostrar lo que exista (o el error de `systemctl`).
+
+`qctl` nunca borra ni reemplaza **ficheros regulares** del directorio destino: solo elimina symlinks. Si encuentra un fichero regular con el mismo nombre, avisa por stderr y lo deja intacto. Esto cubre además ejecutar `qctl` desde dentro del propio `$HOME/.config/containers/systemd` (con un `quadlets/` anidado): ya no crea auto-symlinks y se recupera de los que hubieran dejado versiones anteriores.
+
 ## Ejemplos
 
 ```bash
@@ -123,7 +131,7 @@ cargo run -- logs voicebox
 cargo run -- logsf voicebox
 ```
 
-`qctl start` también sirve como atajo de instalación inicial: si faltan enlaces en `$HOME/.config/containers/systemd`, ejecuta la instalación antes de hacer `start`.
+`qctl start` también sirve como atajo de instalación inicial. Con un servicio, instala **solo** esa unidad si faltaba en `$HOME/.config/containers/systemd` y la arranca; sin argumentos, instala los quadlets que falten y arranca todos.
 
 ## Completions de shell
 
