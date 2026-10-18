@@ -42,6 +42,33 @@ que no se recupera solo, o con efectos secundarios silenciosos:
 - **Compatibilidad**: cambio de comportamiento en la CLI. `start` sin argumentos
   no cambia. `update <nombre-inexistente>` pasa de salir con 0 a fallar.
 
+## Review round (2026-10-18)
+
+A code review of the first round found a blocker and a major, both with the same
+root cause: `start` never considered quadlets whose origin already lives inside the
+target directory tree. Because `install` (correctly) no longer links them, `start`
+looked for `<target_dir>/<name>.container`, did not find it and either did nothing
+(no argument) or recreated the very self-symlink #3 removes (`start <name>`).
+
+- **B1 — `qctl start` without arguments did nothing in the nested layout.**
+  Exit code `0` and only `daemon-reload`, while `develop` at least ran
+  `systemctl --user start other.service`. The "installed" predicate now also accepts
+  a quadlet living anywhere inside the target tree, so the unit is started again.
+- **M1 — `start <name>` recreated the redundant self-symlink.** `install_single`
+  did not consult `source_is_in_target_dir`. It now does, and creates nothing when
+  the origin already lives inside the target tree. `README.md`'s claim that `qctl`
+  "no longer creates auto-symlinks" is true again after this fix.
+- **m1 — dead branch.** The scenario "requested unit not linked after install" was
+  removed together with the `bail!` branch it described: with the new "counts as
+  installed" predicate, a unit collected by `start` is installed by construction
+  (either `install_single`/`install` links it, or it already lives in the target
+  tree), so the branch was unreachable and the scenario could not be tested without
+  contriving a TOCTOU race. The requirement keeps its reachable half: `systemctl`
+  failures are reported and unknown names fail before any side effect.
+- **m2 — missing assertion.** `install_skips_quadlets_in_subdirectories_of_target_dir`
+  now asserts the `Skipping a.container (already in target dir)` message the
+  scenario requires, not only the absence of symlinks.
+
 ## Out of Scope
 
 - `status`, `check`, `logs` y `logsf` no validan nombres: son consultas de solo

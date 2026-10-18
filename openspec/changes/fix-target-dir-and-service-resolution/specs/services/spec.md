@@ -32,14 +32,34 @@ running `daemon-reload` or invoking `systemctl`/`podman`.
 
 ### Requirement: start with a service SHALL install only that unit
 
-When a service is given and its symlink is missing from the target directory,
-`start` SHALL create only that symlink, pointing at the project source. It SHALL NOT
-install unrelated quadlets.
+When a service is given and its quadlet is neither linked into the target directory
+nor already living inside the target directory tree, `start` SHALL create only that
+symlink, pointing at the project source. It SHALL NOT install unrelated quadlets.
 
 #### Scenario: first-run start of one unit
 
 - **WHEN** the project provides `one.container` and `two.container`, nothing is installed, and the user runs `qctl start one`
 - **THEN** only `one.container` is linked into the target directory
+
+### Requirement: start SHALL find units whose quadlet already lives in the target directory
+
+A container unit SHALL count as installed when `<target_dir>/<unit>.container` exists
+— as the symlink `install` creates or as a regular file — **or** when
+`<unit>.container` lives anywhere inside the target directory tree, for example
+`<target_dir>/quadlets/<unit>.container`. `start` SHALL start such a unit, with or
+without a service argument, without `qctl` creating a redundant symlink for it first.
+
+#### Scenario: start one unit whose quadlet already lives in the target tree
+
+- **WHEN** the current directory is the target directory, it contains `quadlets/other.container`, and the user runs `qctl start other`
+- **THEN** `systemctl --user start other.service` runs and the command exits successfully
+- **AND** no `other.container` symlink is created inside the target directory
+
+#### Scenario: start without arguments in a nested layout
+
+- **WHEN** the current directory is the target directory and it contains `quadlets/other.container`
+- **THEN** `qctl start` starts every container unit found, including `other.service`, and exits successfully
+- **AND** it creates no symlink inside the target directory
 
 #### Scenario: start without arguments is unchanged
 
@@ -49,15 +69,12 @@ install unrelated quadlets.
 ### Requirement: start SHALL fail when a requested unit could not be started
 
 `start` SHALL return a non-zero exit code, naming the failing unit(s), when
-`systemctl --user start` fails, and SHALL NOT silently skip a requested unit that
-is missing from the target directory after the install step.
+`systemctl --user start` fails. A requested unit SHALL never be silently skipped:
+`ensure_service_known` rejects a name that matches no quadlet with
+`no such quadlet: <name>` before any side effect, and a requested unit that counts as
+installed is always started.
 
 #### Scenario: systemctl fails
 
 - **WHEN** the fake `systemctl` exits non-zero for `svc`
 - **THEN** `qctl start svc` exits non-zero and the error names `svc`
-
-#### Scenario: requested unit not linked after install
-
-- **WHEN** a requested unit is still absent from the target directory after the install step
-- **THEN** `start` exits non-zero instead of skipping it with a debug message

@@ -33,6 +33,18 @@
 
 ## 4. Release
 
-- [ ] 4.1 `openspec validate fix-target-dir-and-service-resolution --strict`.
+- [x] 4.1 `openspec validate fix-target-dir-and-service-resolution --strict`.
 - [ ] 4.2 `openspec archive fix-target-dir-and-service-resolution` tras el merge.
 - [ ] 4.3 `release/0.3.0` con el ritual de `CONTRIBUTING.md`.
+
+## 5. Segunda ronda (revisión): quadlets que ya viven en el target
+
+- [ ] 5.1 RED `start_service_already_in_target_dir_links_nothing`: cwd = target dir con `quadlets/other.container`; `start other` arranca `other.service` y no deja symlink nuevo (M1).
+- [ ] 5.2 RED `start_without_arguments_starts_units_in_target_subdirs`: mismo layout; `start` registra `--user start other.service` y sale 0 (B1).
+- [ ] 5.3 RED `install_skips_quadlets_in_subdirectories_of_target_dir` asevera el mensaje `Skipping a.container (already in target dir)` (m2).
+- [ ] 5.4 GREEN helper compartido de resolución: unidad → quadlet y colección de unidades a arrancar, considerando enlaces en el target y quadlets dentro del árbol del target.
+- [ ] 5.5 GREEN `install_single` consulta `source_is_in_target_dir` y no enlaza orígenes que ya viven en el target (M1).
+- [ ] 5.6 GREEN `start` arranca las unidades que viven en el árbol del target (B1).
+- [ ] 5.7 Eliminar la rama inalcanzable `is not linked in the target directory` y su escenario de spec (m1).
+- [ ] 5.8 REFACTOR: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`.
+- [ ] 5.9 Docs: `README.md`, `docs/AUDIT.md` (recuento antiguo) y `AGENTS.md`.
