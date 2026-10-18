@@ -11,7 +11,7 @@
 - [x] 1.7 `stop_and_restart_unknown_service_fail`.
 - [x] 1.8 `update_unknown_service_fails`: sale != 0 con `no such quadlet: typo`.
 - [x] 1.9 `start_service_links_only_that_unit`: con dos cuadlets sin instalar, `start one` enlaza solo `one.container`.
-- [ ] 1.10 Ajustar los tests existentes que asuman el contrato viejo (`update` con nombre inexistente saliendo con 0).
+- [x] 1.10 Ajustar los tests existentes que asuman el contrato viejo (`update` con nombre inexistente saliendo con 0). (N/A: ningún test asumía ese contrato.)
 
 ## 2. Implementación (GREEN)
 
@@ -39,12 +39,12 @@
 
 ## 5. Segunda ronda (revisión): quadlets que ya viven en el target
 
-- [ ] 5.1 RED `start_service_already_in_target_dir_links_nothing`: cwd = target dir con `quadlets/other.container`; `start other` arranca `other.service` y no deja symlink nuevo (M1).
-- [ ] 5.2 RED `start_without_arguments_starts_units_in_target_subdirs`: mismo layout; `start` registra `--user start other.service` y sale 0 (B1).
-- [ ] 5.3 RED `install_skips_quadlets_in_subdirectories_of_target_dir` asevera el mensaje `Skipping a.container (already in target dir)` (m2).
-- [ ] 5.4 GREEN helper compartido de resolución: unidad → quadlet y colección de unidades a arrancar, considerando enlaces en el target y quadlets dentro del árbol del target.
-- [ ] 5.5 GREEN `install_single` consulta `source_is_in_target_dir` y no enlaza orígenes que ya viven en el target (M1).
-- [ ] 5.6 GREEN `start` arranca las unidades que viven en el árbol del target (B1).
-- [ ] 5.7 Eliminar la rama inalcanzable `is not linked in the target directory` y su escenario de spec (m1).
-- [ ] 5.8 REFACTOR: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`.
-- [ ] 5.9 Docs: `README.md`, `docs/AUDIT.md` (recuento antiguo) y `AGENTS.md`.
+- [x] 5.1 RED `start_service_already_in_target_dir_links_nothing`: cwd = target dir con `quadlets/other.container`; `start other` arranca `other.service` y no deja symlink nuevo (M1).
+- [x] 5.2 RED `start_without_arguments_starts_units_in_target_subdirs`: mismo layout; `start` registra `--user start other.service` y sale 0 (B1).
+- [x] 5.3 RED `install_skips_quadlets_in_subdirectories_of_target_dir` asevera el mensaje `Skipping a.container (already in target dir)` (m2).
+- [x] 5.4 GREEN helper compartido de resolución: unidad → quadlet y colección de unidades a arrancar, considerando enlaces en el target y quadlets dentro del árbol del target.
+- [x] 5.5 GREEN `install_single` consulta `source_is_in_target_dir` y no enlaza orígenes que ya viven en el target (M1).
+- [x] 5.6 GREEN `start` arranca las unidades que viven en el árbol del target (B1).
+- [x] 5.7 Eliminar la rama inalcanzable `is not linked in the target directory` y su escenario de spec (m1).
+- [x] 5.8 REFACTOR: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`.
+- [x] 5.9 Docs: `README.md`, `docs/AUDIT.md` (recuento antiguo) y `AGENTS.md`.
