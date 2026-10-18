@@ -927,6 +927,12 @@ fn install_skips_quadlets_in_subdirectories_of_target_dir() {
     let first = run_qctl_with_path(&home, &target, Path::new(&path), &["install"]);
     assert!(first.status.success(), "first install failed: {first:?}");
 
+    let first_out = String::from_utf8_lossy(&first.stdout);
+    assert!(
+        first_out.contains("Skipping other.container (already in target dir)"),
+        "install must report the nested quadlet it skips: {first_out}"
+    );
+
     // A quadlet living in a subdirectory of the target dir is already
     // installed: nothing may be linked into the target dir itself.
     assert!(
@@ -1227,4 +1233,73 @@ fn installed_unit_survives_missing_source() {
             "{action} svc must succeed: {output:?}"
         );
     }
+}
+
+#[test]
+fn start_service_already_in_target_dir_links_nothing() {
+    let root = TestDir::new("start-single-in-target");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let nested = target.join("quadlets");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&nested).expect("failed to create nested target dir");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    write_file(
+        &nested.join("other.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &target, Path::new(&path), &["start", "other"]);
+    assert!(output.status.success(), "start other failed: {output:?}");
+
+    let logged = fs::read_to_string(&log).expect("missing systemctl log");
+    assert!(
+        logged.contains("--user start other.service"),
+        "start other must start the unit that lives in a target subdirectory: {logged}"
+    );
+
+    assert!(
+        fs::symlink_metadata(target.join("other.container")).is_err(),
+        "start other must not create an entry for a quadlet already in the target dir"
+    );
+    assert!(
+        symlinks_under(&target).is_empty(),
+        "start other must not create any symlink inside the target dir: {:?}",
+        symlinks_under(&target)
+    );
+}
+
+#[test]
+fn start_without_arguments_starts_units_in_target_subdirs() {
+    let root = TestDir::new("start-subdir-of-target");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let nested = target.join("quadlets");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&nested).expect("failed to create nested target dir");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    write_file(
+        &nested.join("other.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &target, Path::new(&path), &["start"]);
+    assert!(output.status.success(), "start must succeed: {output:?}");
+
+    let logged = fs::read_to_string(&log).expect("missing systemctl log");
+    assert!(
+        logged.contains("--user start other.service"),
+        "start without arguments must start a unit living in a target subdirectory: {logged}"
+    );
+    assert!(
+        symlinks_under(&target).is_empty(),
+        "start must not create any symlink inside the target dir: {:?}",
+        symlinks_under(&target)
+    );
 }
