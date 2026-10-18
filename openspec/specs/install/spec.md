@@ -1,7 +1,8 @@
 # install Specification
 
 ## Purpose
-TBD - created by archiving change fix-target-dir-and-service-resolution. Update Purpose after archive.
+
+Defines how `qctl` links a project's quadlets into the systemd user target directory: what counts as already installed, how entries that share a name are treated, and how regular files in the target directory are protected.
 
 ## Requirements
 

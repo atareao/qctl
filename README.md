@@ -104,6 +104,15 @@ qctl --dry-run clean-volumes
 
 Los comandos de solo consulta (`status`, `logs`, `logsf`, `check`, `completions`) siguen consultando el sistema aunque se use `--dry-run`, porque son de lectura y su utilidad desaparecería al simularlos. `qctl menu --dry-run` también sigue consultando para dibujar la tabla, pero las acciones que mutan (`start`, `stop`, `restart`) respetan `--dry-run`.
 
+`--timeout <SEGUNDOS>` limita las herramientas externas que `qctl` espera: `systemctl --user` (`start`, `stop`, `restart`, `daemon-reload`, `is-active`), `/usr/lib/podman/quadlet` y `podman volume rm`. Por defecto son **60 segundos**; `--timeout 0` desactiva el límite. Al agotarse el plazo, `qctl` termina el proceso y falla con un error que nombra el comando y la unidad.
+
+Dos invocaciones quedan **fuera** del plazo, a propósito:
+
+- `podman pull`: depende de la red y puede tardar legítimamente más que el valor por defecto.
+- `logs` y `logsf`: ejecutan `journalctl` en modo *follow* (`-f`) y deben correr hasta que los interrumpas.
+
+`logs` y `logsf` invocan además `journalctl` con `--no-pager`, para que un paginador configurado en tu sistema no se apodere del terminal de un comando pensado para ser scriptable.
+
 ### Nombres de servicio y seguridad del directorio destino
 
 Los comandos que actúan sobre unidades (`start`, `stop`, `restart`, `update`) validan el nombre antes de tocar nada: si no corresponde a ningún quadlet, fallan con `no such quadlet: <nombre>` y código de salida distinto de cero. Un nombre se acepta si existe `<origen>/<nombre>.container` **o** `<destino>/<nombre>.container`; lo segundo cubre unidades ya instaladas cuyo origen se borró.
@@ -111,6 +120,14 @@ Los comandos que actúan sobre unidades (`start`, `stop`, `restart`, `update`) v
 `status`, `check`, `logs` y `logsf` no validan nombres: son consultas y se limitan a mostrar lo que exista (o el error de `systemctl`).
 
 `qctl` nunca borra ni reemplaza **ficheros regulares** del directorio destino: solo elimina symlinks. Si encuentra un fichero regular con el mismo nombre, avisa por stderr y lo deja intacto. Esto cubre además ejecutar `qctl` desde dentro del propio `$HOME/.config/containers/systemd` (con un `quadlets/` anidado): ya no crea auto-symlinks y se recupera de los que hubieran dejado versiones anteriores.
+
+### Alcance de los comandos de unidad
+
+`start`, `stop` y `restart` **sin argumentos** actúan solo sobre los quadlets del proyecto actual: los que hay en `./quadlets/` y en el directorio de trabajo. No alcanzan las unidades que otros proyectos hayan enlazado en el mismo `$HOME/.config/containers/systemd`. Con dos proyectos enlazados en el mismo `HOME`, `cd proyectoA && qctl stop` no toca los servicios de `proyectoB`. La tabla que estos comandos imprimen al terminar refleja ese mismo conjunto.
+
+`status` y `menu` son consultas y sí muestran **todo** el directorio destino, vengan las unidades del proyecto que vengan, para que veas de un vistazo qué hay instalado en el `HOME`.
+
+Con un nombre explícito nada cambia: `qctl stop <nombre>` se resuelve contra el proyecto y contra el directorio destino, así que una unidad instalada cuyo origen desapareció se sigue pudiendo parar por su nombre.
 
 ### Alcance del descubrimiento
 
@@ -194,7 +211,7 @@ Acciones disponibles:
 - `l número` o `número l`: muestra logs recientes y vuelve al menú
 - `q`: sale del menú
 
-El menú también incluye unidades ya enlazadas en `$HOME/.config/containers/systemd`, aunque se ejecute desde otro directorio.
+El menú también incluye unidades ya enlazadas en `$HOME/.config/containers/systemd`, aunque se ejecute desde otro directorio: es una vista de solo lectura. Actuar sobre una fila concreta es una elección explícita de esa unidad, así que el menú no amplía el alcance de `start`, `stop` y `restart` descrito en [Alcance de los comandos de unidad](#alcance-de-los-comandos-de-unidad).
 
 ## Limpieza de volúmenes
 

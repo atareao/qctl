@@ -1,7 +1,8 @@
 # services Specification
 
 ## Purpose
-TBD - created by archiving change fix-target-dir-and-service-resolution. Update Purpose after archive.
+
+Defines which container units `qctl` acts on: the scope of the unit commands, how a service name is validated and resolved, when `start` installs a unit on demand, and how failures are reported.
 
 ## Requirements
 
