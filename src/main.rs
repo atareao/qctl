@@ -218,7 +218,7 @@ async fn install(ctx: &AppContext) -> Result<()> {
             .with_context(|| format!("failed to create {}", ctx.target_dir.display()))?;
     }
 
-    let target_canon = fs::canonicalize(&ctx.target_dir).await.ok();
+    let target_canon = canonical_target_dir(ctx).await;
     let files = collect_quadlets(&ctx.source_dirs).await?;
     for src in files {
         let name = basename(&src)?;
@@ -235,6 +235,16 @@ async fn install(ctx: &AppContext) -> Result<()> {
     daemon_reload(ctx).await?;
     debug!("Install complete");
     Ok(())
+}
+
+/// Canonical form of the target directory, when it exists.
+///
+/// `None` means the directory is absent: nothing can live inside it yet, so every
+/// source counts as external and is linked normally. Callers that need to know
+/// whether a source sits *inside* the target tree pass the result to
+/// `source_is_in_target_dir`.
+async fn canonical_target_dir(ctx: &AppContext) -> Option<PathBuf> {
+    fs::canonicalize(&ctx.target_dir).await.ok()
 }
 
 /// Returns true when `src` already lives inside the target directory, comparing
@@ -259,6 +269,27 @@ async fn source_is_in_target_dir(src: &Path, target_canon: Option<&Path>) -> boo
         return false;
     };
     parent_canon.starts_with(target_canon)
+}
+
+/// True when `<unit>.container` counts as installed for the target directory:
+/// either an entry directly inside it — the symlink `install` creates, or a
+/// regular file — or a quadlet living anywhere inside its tree, for example
+/// `<target_dir>/quadlets/<unit>.container`.
+///
+/// `install` deliberately leaves quadlets that already live inside the target
+/// tree unlinked, so commands that act on units must accept them by name instead
+/// of looking only at `<target_dir>/<unit>.container`; otherwise they would
+/// either recreate the redundant self-symlink or silently skip the unit.
+async fn unit_installed_in_target_dir(ctx: &AppContext, unit: &str) -> Result<bool> {
+    let in_target = ctx.target_dir.join(format!("{unit}.container"));
+    if path_exists(&in_target).await? {
+        return Ok(true);
+    }
+
+    let Some(src) = find_source_quadlet(ctx, &format!("{unit}.container")).await? else {
+        return Ok(false);
+    };
+    Ok(source_is_in_target_dir(&src, canonical_target_dir(ctx).await.as_deref()).await)
 }
 
 /// Stops container units and removes their symlinks from the target directory.
@@ -352,13 +383,7 @@ async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
             continue;
         }
 
-        let unit_file = ctx.target_dir.join(format!("{unit}.container"));
-        if !path_exists(&unit_file).await? {
-            if requested {
-                // An explicitly requested unit that is still missing after the
-                // install step is a hard failure; a bare `start` just skips it.
-                bail!("{unit} is not linked in the target directory");
-            }
+        if !unit_installed_in_target_dir(ctx, &unit).await? {
             debug!("Skipping {unit} (not linked in target dir)");
             continue;
         }
@@ -387,6 +412,17 @@ async fn install_single(ctx: &AppContext, unit: &str) -> Result<()> {
     let Some(src) = find_source_quadlet(ctx, &file_name).await? else {
         bail!("no such quadlet: {unit}");
     };
+
+    // A quadlet that already lives inside the target tree is installed by
+    // definition: `install` does not link it, and `start` must not create the
+    // redundant self-symlink #3 removes either. Check the origin, not the
+    // destination: an existing `<target_dir>/<unit>.container` never reaches
+    // this function, its caller skips it first.
+    if source_is_in_target_dir(&src, canonical_target_dir(ctx).await.as_deref()).await {
+        debug!("{unit} already lives in the target dir; not linking it");
+        return Ok(());
+    }
+
     let dest = ctx.target_dir.join(&file_name);
 
     if ctx.dry_run {
