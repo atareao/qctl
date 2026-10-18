@@ -229,11 +229,7 @@ async fn install(ctx: &AppContext) -> Result<()> {
             continue;
         }
 
-        if ctx.dry_run {
-            println!("DRY-RUN link {} -> {}", src.display(), dest.display());
-        } else if link_or_replace(&src, &dest).await? {
-            debug!("Linked {} -> {}", src.display(), dest.display());
-        }
+        link_quadlet(ctx, &src, &dest).await?;
     }
 
     daemon_reload(ctx).await?;
@@ -265,6 +261,10 @@ async fn source_is_in_target_dir(src: &Path, target_canon: Option<&Path>) -> boo
     parent_canon.starts_with(target_canon)
 }
 
+/// Stops container units and removes their symlinks from the target directory.
+/// Only symlinks are removed: a regular file that merely shares a quadlet name
+/// is warned about on stderr and left untouched (its stop is skipped too),
+/// because such a file does not belong to `qctl`.
 async fn uninstall(ctx: &AppContext) -> Result<()> {
     debug!(
         "Stopping services and removing symlinks from {}",
@@ -390,17 +390,31 @@ async fn install_single(ctx: &AppContext, unit: &str) -> Result<()> {
     let dest = ctx.target_dir.join(&file_name);
 
     if ctx.dry_run {
-        println!("DRY-RUN link {} -> {}", src.display(), dest.display());
-        return Ok(());
+        return link_quadlet(ctx, &src, &dest).await;
     }
 
     fs::create_dir_all(&ctx.target_dir)
         .await
         .with_context(|| format!("failed to create {}", ctx.target_dir.display()))?;
 
-    link_or_replace(&src, &dest).await?;
-    daemon_reload(ctx).await?;
-    debug!("Linked {} -> {}", src.display(), dest.display());
+    link_quadlet(ctx, &src, &dest).await?;
+    daemon_reload(ctx).await
+}
+
+/// Plans or performs the `src -> dest` symlink in one place: under `--dry-run`
+/// it prints the planned link and creates nothing, otherwise it calls
+/// `link_or_replace` and logs the link once created. A pre-existing regular file
+/// is left in place (already warned about by `link_or_replace`), so `install`
+/// and `install_single` share the same stderr contract.
+async fn link_quadlet(ctx: &AppContext, src: &Path, dest: &Path) -> Result<()> {
+    if ctx.dry_run {
+        println!("DRY-RUN link {} -> {}", src.display(), dest.display());
+        return Ok(());
+    }
+
+    if link_or_replace(src, dest).await? {
+        debug!("Linked {} -> {}", src.display(), dest.display());
+    }
     Ok(())
 }
 
@@ -1040,13 +1054,14 @@ fn discover_source_dirs(root_dir: &Path) -> Vec<PathBuf> {
     source_dirs
 }
 
-/// True when `<unit>.container` exists in any source dir or in the target dir.
+/// True when `<unit>.container` exists as a source quadlet or as an entry in the
+/// target directory. The target directory is included so a unit that is already
+/// installed keeps working after its project source disappears: `start`/`stop`
+/// must still recognise it instead of rejecting the name.
 async fn unit_is_known(ctx: &AppContext, unit: &str) -> Result<bool> {
     let file_name = format!("{unit}.container");
-    for dir in &ctx.source_dirs {
-        if path_exists(&dir.join(&file_name)).await? {
-            return Ok(true);
-        }
+    if find_source_quadlet(ctx, &file_name).await?.is_some() {
+        return Ok(true);
     }
     path_exists(&ctx.target_dir.join(&file_name)).await
 }
@@ -1091,9 +1106,17 @@ async fn resolve_targets(ctx: &AppContext, service: Option<String>) -> Result<Ve
     Ok(out)
 }
 
+/// Collects every quadlet file found in `source_dirs`, keyed by file name.
+///
+/// When the same name shows up twice, the canonical targets are compared: entries
+/// that resolve to the same file (for example a stale self-link left inside the
+/// target directory by an older version) collapse into one, preferring the real
+/// file over the symlink pointing at it. Two *different* files that merely share
+/// a name still fail, so the user has to disambiguate instead of `qctl` silently
+/// picking one.
 async fn collect_quadlets(source_dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    // Each entry keeps its file name and whether it is a symlink, so a collision
-    // can be resolved by canonical target and the real file preferred.
+    // Each entry keeps its path and whether it is a symlink, so a collision can
+    // be resolved by canonical target and the real file preferred.
     let mut out: Vec<(PathBuf, bool)> = Vec::new();
     let mut seen: HashMap<String, usize> = HashMap::new();
 
