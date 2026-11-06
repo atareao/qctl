@@ -42,6 +42,18 @@ sudo install -m 755 qctl-linux-x86_64 /usr/local/bin/qctl
 qctl --version
 ```
 
+El binario se publica como artefacto de **GitHub Releases** en [github.com/atareao/qctl/releases](https://github.com/atareao/qctl/releases). La publicación es automática: al crear una release, el workflow `release.yml` de GitHub Actions compila en `ubuntu-24.04` un binario estático `x86_64-unknown-linux-musl` (con `RUSTFLAGS="-C target-feature=+crt-static"`), verifica la compilación con `cargo fmt --check`, `cargo clippy -- -D warnings` y `cargo test`, y sube como assets el binario `qctl-linux-x86_64` y su checksum `.sha256`.
+
+Para descargar una versión concreta en lugar de la última:
+
+```bash
+curl -LO https://github.com/atareao/qctl/releases/download/v0.4.0/qctl-linux-x86_64
+curl -LO https://github.com/atareao/qctl/releases/download/v0.4.0/qctl-linux-x86_64.sha256
+sha256sum -c qctl-linux-x86_64.sha256
+```
+
+Últimas versiones publicadas: `v0.4.0` (actual), `v0.3.0`, `v0.2.2`, `v0.2.1`, `v0.2.0`, `v0.1.3`, `v0.1.1`.
+
 ### Compilación desde el código
 
 Compilación de desarrollo:
