@@ -280,3 +280,69 @@ Decisions and compatibility:
   disappeared remains addressable by name.
 - The `--dry-run` contract and the existing messages (`Skipping …`, `no such quadlet`,
   `duplicate quadlet file name`) are untouched.
+
+## Round 2026-11-06 — Uninstall ghost units and status output contract
+
+Fixes for three findings from the PR review, proposed and validated through the
+OpenSpec change `harden-uninstall-and-status-output`.
+
+Findings fixed:
+
+- **#7 — `uninstall` left ghost units.** `uninstall()` only stopped the generated unit
+  when the quadlet extension was `container` (`if ext == "container"`). The symlinks of
+  `.volume`/`.network` were removed, but the unit the quadlet generator derived from
+  them stayed active; on the real stack a `microbin-microbin-volume.service` was left
+  in `not-found / active / exited` after an `uninstall` and had to be stopped by hand.
+  `uninstall` now stops the generated unit for every symlink it removes, mapping the
+  quadlet type to the unit name: `<stem>.service` for `.container`,
+  `<stem>-volume.service` for `.volume` and `<stem>-network.service` for `.network`
+  (new `generated_unit` helper). A failed stop still only warns and the removal
+  continues; regular (non-symlink) files are never stopped.
+- **#8 — `--compact` was not parseable.** The help advertised *"Compact output format
+  for scripts"*, but the implementation printed `unit<TAB>✅<TAB>🟢`. A script could not
+  consume that without stripping emoji. `--compact` now emits plain TSV,
+  `<unit>\t<linked|missing>\t<running|stopped|->`, one undecorated line per unit and no
+  `Summary:` block. **Breaking** for anyone parsing the old decorated format; the new
+  format is the one the help already promised.
+- **#9 — no view of the current stack in `status`.** The wide view (every unit in the
+  target directory, from any project) is a deliberate, already specified default, so the
+  gap was the absence of a way to ask for the local view: from inside a stack there was
+  no way to get *that* stack's state without filtering by hand. `status` gained an
+  opt-in `--project` flag that restricts the report to the current project's quadlets,
+  the same scope `start`/`stop`/`restart` use; the default and `menu` are unchanged.
+
+Tests covering each fix:
+
+| Fix | Integration tests |
+| --- | --- |
+| #7 (volume) | `uninstall_stops_generated_volume_unit`, `uninstall_keeps_going_when_stop_fails` |
+| #7 (network) | `uninstall_stops_generated_network_unit` |
+| #7 (container regression, regular files) | `uninstall_still_stops_container_unit`, `uninstall_does_not_stop_regular_files` |
+| #7 (dotted stem) | `uninstall_stops_generated_unit_for_dotted_container_name` |
+| #8 (TSV, no decoration) | `compact_output_has_no_emoji`, `compact_output_is_tab_separated_plain_tokens`, `compact_linked_inactive_unit_reports_stopped`, `compact_missing_unit_reports_dash_state`, `compact_prints_no_summary`, `compact_status_lists_missing_container_without_summary` |
+| #8 (human table kept) | `human_readable_status_keeps_decoration` |
+| #8 (empty input) | `compact_with_no_units_prints_nothing` |
+| #9 (project scope) | `status_project_lists_only_current_project`, `status_project_with_explicit_service_resolves_the_name`, `status_project_with_no_units_exits_successfully` |
+| #9 (wide default kept) | `status_without_flag_reports_whole_target_dir`, `status_reports_units_from_every_project` |
+
+Verification:
+
+- Unit tests: 7 passed
+- Integration tests: 60 passed (67 total)
+- `cargo fmt --all -- --check` and
+  `cargo clippy --all-targets --all-features -- -D warnings` clean.
+
+Decisions and compatibility:
+
+- **Breaking change**: `status --compact` no longer prints emoji. Documented in
+  `README.md`.
+- `status --project` is opt-in; the wide default and `menu` are untouched, so the
+  existing `services` spec is not broken.
+- An explicitly named service is resolved by name with or without `--project`; the
+  flag only sets the argument-less scope.
+- Quadlets whose source disappeared are out of scope for `--project` (they are not
+  collected from the project source dirs); address them by name or with the wide view.
+- `uninstall` derives the unit name with an explicit mapping (`generated_unit`) that
+  never relies on `systemd_unit`'s "already has a dot" heuristic, so a dotted stem
+  (`voicebox.prod.container`) still stops `voicebox.prod.service`. Raw unit quadlets
+  (`.service`, `.socket`, `.mount`) keep their own unit name.
