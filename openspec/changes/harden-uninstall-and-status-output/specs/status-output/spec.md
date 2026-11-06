@@ -37,7 +37,12 @@ identical to the human-readable table.
 #### Scenario: compact prints no summary block
 
 - **WHEN** the user runs `qctl status --compact`
-- **THEN** stdout contains no `Summary:` line and no `total`/`linked`/`running`/`stopped`/`missing` counters
+- **THEN** stdout contains no `Summary:` block and no counter lines (the `total … = …` lines the human-readable summary prints); the `linked`/`running`/`stopped`/`missing` tokens that are legitimate TSV field values SHALL still appear
+
+#### Scenario: compact with no units prints nothing
+
+- **WHEN** the current project collects no container quadlets and the user runs `qctl status --compact`
+- **THEN** stdout is empty and the command exits successfully
 
 #### Scenario: the human-readable table is unchanged
 

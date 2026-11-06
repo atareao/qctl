@@ -24,8 +24,8 @@ unaffected and SHALL keep the wide view.
 
 #### Scenario: status --project combined with an explicit service
 
-- **WHEN** the user runs `qctl status --project voicebox` and `voicebox.container` belongs to the current project
-- **THEN** the report is scoped to the current project and shows `voicebox`
+- **WHEN** the user runs `qctl status --project voicebox`
+- **THEN** the report shows `voicebox`, because an explicitly named service is resolved by name with or without `--project` (the flag only sets the argument-less scope and does not restrict a name)
 
 #### Scenario: status --project with no units in the current project
 
