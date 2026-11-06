@@ -490,7 +490,7 @@ fn compact_status_lists_missing_container_without_summary() {
     assert!(output.status.success(), "{output:?}");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("voicebox\t❌\t⚫"));
+    assert!(stdout.contains("voicebox\tmissing\t-"));
     assert!(!stdout.contains("Summary:"));
 }
 
@@ -1684,5 +1684,567 @@ fn negative_timeout_is_rejected() {
     assert!(
         !output.status.success(),
         "a negative timeout must be rejected: {output:?}"
+    );
+}
+
+/// A fake `systemctl` that reports every queried unit as `active` on
+/// `is-active` and logs every invocation, so a compact-status test can prove a
+/// linked unit renders as `running`.
+fn fake_active_systemctl(bin: &Path, log: &Path) {
+    let script = format!(
+        r#"#!/bin/sh
+echo "$@" >> {log}
+if [ "$2" = "is-active" ]; then
+  echo active
+fi
+exit 0
+"#,
+        log = log.display()
+    );
+    let systemctl = bin.join("systemctl");
+    write_file(&systemctl, &script);
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755))
+        .expect("failed to chmod fake systemctl");
+}
+
+#[test]
+fn uninstall_stops_generated_volume_unit() {
+    let root = TestDir::new("uninstall-volume-unit");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+
+    let container_src = project.join("microbin.container");
+    let volume_src = project.join("microbin-microbin.volume");
+    write_file(&container_src, "[Container]\nImage=example\n");
+    write_file(&volume_src, "[Volume]\nVolumeName=microbin\n");
+    let container_link = target.join("microbin.container");
+    let volume_link = target.join("microbin-microbin.volume");
+    symlink(&container_src, &container_link).expect("failed to link container");
+    symlink(&volume_src, &volume_link).expect("failed to link volume");
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["uninstall"]);
+    assert!(output.status.success(), "uninstall failed: {output:?}");
+
+    let logged = fs::read_to_string(&log).expect("missing systemctl log");
+    assert!(
+        logged.contains("--user stop microbin.service"),
+        "uninstall must stop the container unit: {logged}"
+    );
+    assert!(
+        logged.contains("--user stop microbin-microbin-volume.service"),
+        "uninstall must stop the generated volume unit: {logged}"
+    );
+    assert!(
+        !is_symlink(&container_link),
+        "the container symlink must be removed"
+    );
+    assert!(
+        !is_symlink(&volume_link),
+        "the volume symlink must be removed"
+    );
+}
+
+#[test]
+fn uninstall_stops_generated_unit_for_dotted_container_name() {
+    let root = TestDir::new("uninstall-dotted-container");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+
+    let source = project.join("voicebox.prod.container");
+    let link = target.join("voicebox.prod.container");
+    write_file(&source, "[Container]\nImage=example\n");
+    symlink(&source, &link).expect("failed to link container");
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["uninstall"]);
+    assert!(output.status.success(), "uninstall failed: {output:?}");
+
+    let logged = fs::read_to_string(&log).expect("missing systemctl log");
+    assert!(
+        logged.contains("--user stop voicebox.prod.service"),
+        "a dotted stem must still be stopped with its .service suffix: {logged}"
+    );
+    assert!(!is_symlink(&link), "the container symlink must be removed");
+}
+
+#[test]
+fn uninstall_stops_generated_network_unit() {
+    let root = TestDir::new("uninstall-network-unit");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+
+    let container_src = project.join("stack.container");
+    let network_src = project.join("stack.network");
+    write_file(&container_src, "[Container]\nImage=example\n");
+    write_file(&network_src, "[Network]\n");
+    let container_link = target.join("stack.container");
+    let network_link = target.join("stack.network");
+    symlink(&container_src, &container_link).expect("failed to link container");
+    symlink(&network_src, &network_link).expect("failed to link network");
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["uninstall"]);
+    assert!(output.status.success(), "uninstall failed: {output:?}");
+
+    let logged = fs::read_to_string(&log).expect("missing systemctl log");
+    assert!(
+        logged.contains("--user stop stack.service"),
+        "uninstall must stop the container unit: {logged}"
+    );
+    assert!(
+        logged.contains("--user stop stack-network.service"),
+        "uninstall must stop the generated network unit: {logged}"
+    );
+    assert!(
+        !is_symlink(&container_link),
+        "the container symlink must be removed"
+    );
+    assert!(
+        !is_symlink(&network_link),
+        "the network symlink must be removed"
+    );
+}
+
+#[test]
+fn uninstall_still_stops_container_unit() {
+    let root = TestDir::new("uninstall-still-container");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+
+    let source = project.join("voicebox.container");
+    let link = target.join("voicebox.container");
+    write_file(&source, "[Container]\nImage=example\n");
+    symlink(&source, &link).expect("failed to link container");
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["uninstall"]);
+    assert!(output.status.success(), "uninstall failed: {output:?}");
+
+    let logged = fs::read_to_string(&log).expect("missing systemctl log");
+    assert!(
+        logged.contains("--user stop voicebox.service"),
+        "uninstall must keep stopping the container unit: {logged}"
+    );
+    assert!(!is_symlink(&link), "the container symlink must be removed");
+}
+
+#[test]
+fn uninstall_does_not_stop_regular_files() {
+    let root = TestDir::new("uninstall-regular-stop");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&target).expect("failed to create target dir");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+
+    // A regular file that shadows a quadlet name: uninstall must neither stop
+    // its generated unit nor remove it.
+    let file = target.join("one.container");
+    write_file(&file, "[Container]\nImage=sentinel\n");
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &target, Path::new(&path), &["uninstall"]);
+    assert!(output.status.success(), "uninstall failed: {output:?}");
+
+    let logged = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !logged.contains("stop one.service"),
+        "a regular file must never be stopped: {logged}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).expect("regular file must survive uninstall"),
+        "[Container]\nImage=sentinel\n"
+    );
+}
+
+#[test]
+fn uninstall_keeps_going_when_stop_fails() {
+    let root = TestDir::new("uninstall-stop-fails");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+
+    let script = format!(
+        r#"#!/bin/sh
+echo "$@" >> {log}
+if [ "$2" = "stop" ] && [ "$3" = "stack-x-volume.service" ]; then
+  echo "volume stop failed" >&2
+  exit 7
+fi
+exit 0
+"#,
+        log = log.display()
+    );
+    let systemctl = bin.join("systemctl");
+    write_file(&systemctl, &script);
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755))
+        .expect("failed to chmod fake systemctl");
+
+    let container_src = project.join("stack.container");
+    let volume_src = project.join("stack-x.volume");
+    write_file(&container_src, "[Container]\nImage=example\n");
+    write_file(&volume_src, "[Volume]\nVolumeName=x\n");
+    let container_link = target.join("stack.container");
+    let volume_link = target.join("stack-x.volume");
+    symlink(&container_src, &container_link).expect("failed to link container");
+    symlink(&volume_src, &volume_link).expect("failed to link volume");
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["uninstall"]);
+    assert!(
+        output.status.success(),
+        "a failed stop must not abort uninstall: {output:?}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to stop stack-x-volume"),
+        "the failed stop must be warned about: {stderr}"
+    );
+    assert!(
+        !is_symlink(&volume_link),
+        "uninstall must remove the symlink even after a failed stop"
+    );
+    assert!(
+        !is_symlink(&container_link),
+        "uninstall must continue with the remaining quadlets"
+    );
+}
+
+#[test]
+fn compact_output_has_no_emoji() {
+    let root = TestDir::new("compact-no-emoji");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_active_systemctl(&bin, &log);
+
+    let source = project.join("voicebox.container");
+    write_file(&source, "[Container]\nImage=example\n");
+    symlink(&source, target.join("voicebox.container")).expect("failed to link container");
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["status", "--compact"]);
+    assert!(output.status.success(), "status failed: {output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for emoji in ["✅", "❌", "🟢", "🟡", "⚫"] {
+        assert!(
+            !stdout.contains(emoji),
+            "compact output must be free of emoji ({emoji}): {stdout}"
+        );
+    }
+}
+
+#[test]
+fn compact_output_is_tab_separated_plain_tokens() {
+    let root = TestDir::new("compact-tokens");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_active_systemctl(&bin, &log);
+
+    let source = project.join("voicebox.container");
+    write_file(&source, "[Container]\nImage=example\n");
+    symlink(&source, target.join("voicebox.container")).expect("failed to link container");
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["status", "--compact"]);
+    assert!(output.status.success(), "status failed: {output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "voicebox\tlinked\trunning"),
+        "expected exact TSV line 'voicebox\\tlinked\\trunning': {stdout}"
+    );
+}
+
+#[test]
+fn compact_linked_inactive_unit_reports_stopped() {
+    let root = TestDir::new("compact-stopped");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    // This fake never answers `active` on `is-active`, so the linked unit is
+    // reported as stopped.
+    fake_systemctl(&bin, &log);
+
+    let source = project.join("voicebox.container");
+    write_file(&source, "[Container]\nImage=example\n");
+    symlink(&source, target.join("voicebox.container")).expect("failed to link container");
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["status", "--compact"]);
+    assert!(output.status.success(), "status failed: {output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "voicebox\tlinked\tstopped"),
+        "expected exact TSV line 'voicebox\\tlinked\\tstopped': {stdout}"
+    );
+}
+
+#[test]
+fn compact_missing_unit_reports_dash_state() {
+    let root = TestDir::new("compact-missing");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&home).expect("failed to create home");
+    write_file(
+        &project.join("voicebox.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let output = run_qctl(&home, &project, &["status", "--compact"]);
+    assert!(output.status.success(), "status failed: {output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().any(|line| line == "voicebox\tmissing\t-"),
+        "expected exact TSV line 'voicebox\\tmissing\\t-': {stdout}"
+    );
+}
+
+#[test]
+fn compact_prints_no_summary() {
+    let root = TestDir::new("compact-no-summary");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&home).expect("failed to create home");
+    write_file(
+        &project.join("voicebox.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let output = run_qctl(&home, &project, &["status", "--compact"]);
+    assert!(output.status.success(), "status failed: {output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("Summary:"), "no summary block: {stdout}");
+    assert!(!stdout.contains("total"), "no counters: {stdout}");
+}
+
+#[test]
+fn human_readable_status_keeps_decoration() {
+    let root = TestDir::new("status-human");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_active_systemctl(&bin, &log);
+
+    let source = project.join("voicebox.container");
+    write_file(&source, "[Container]\nImage=example\n");
+    symlink(&source, target.join("voicebox.container")).expect("failed to link container");
+
+    let path = prepend_path(&bin);
+    let output = run_qctl_with_path(&home, &project, Path::new(&path), &["status"]);
+    assert!(output.status.success(), "status failed: {output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Summary:"),
+        "the human-readable status must keep its summary block: {stdout}"
+    );
+    assert!(
+        stdout.contains("✅") && stdout.contains("🟢"),
+        "the human-readable status must keep its emoji decoration: {stdout}"
+    );
+}
+
+#[test]
+fn compact_with_no_units_prints_nothing() {
+    let root = TestDir::new("compact-empty");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&target).expect("failed to create target");
+
+    let output = run_qctl(&home, &project, &["status", "--compact"]);
+    assert!(output.status.success(), "status failed: {output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.is_empty(),
+        "compact with no units must print nothing: {stdout:?}"
+    );
+}
+
+#[test]
+fn status_project_lists_only_current_project() {
+    let root = TestDir::new("status-project-scope");
+    let layout = LocalScopeLayout::new(root.path(), "example");
+    fake_systemctl(&layout.bin, &layout.log);
+
+    let path = layout.path();
+    let output = run_qctl_with_path(
+        &layout.home,
+        &layout.proj_a,
+        Path::new(&path),
+        &["status", "--project"],
+    );
+    assert!(
+        output.status.success(),
+        "status --project failed: {output:?}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("alpha"),
+        "status --project must list the current project's unit: {stdout}"
+    );
+    assert!(
+        !stdout.contains("bravo"),
+        "status --project must hide another project's unit: {stdout}"
+    );
+}
+
+#[test]
+fn status_without_flag_reports_whole_target_dir() {
+    let root = TestDir::new("status-default-wide");
+    let layout = LocalScopeLayout::new(root.path(), "example");
+    fake_systemctl(&layout.bin, &layout.log);
+
+    let path = layout.path();
+    let output = run_qctl_with_path(&layout.home, &layout.proj_a, Path::new(&path), &["status"]);
+    assert!(output.status.success(), "status failed: {output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("alpha"),
+        "the default view must report the current project's unit: {stdout}"
+    );
+    assert!(
+        stdout.contains("bravo"),
+        "the default view must report the whole target directory: {stdout}"
+    );
+}
+
+#[test]
+fn status_project_with_explicit_service_resolves_the_name() {
+    let root = TestDir::new("status-project-explicit");
+    let layout = LocalScopeLayout::new(root.path(), "example");
+    fake_systemctl(&layout.bin, &layout.log);
+
+    // A name given explicitly is resolved with or without `--project`: the flag
+    // only widens/narrows the argument-less scope, it does not restrict a name.
+    // This test therefore documents that documented behaviour, not scope.
+    let path = layout.path();
+    let output = run_qctl_with_path(
+        &layout.home,
+        &layout.proj_a,
+        Path::new(&path),
+        &["status", "--project", "voicebox"],
+    );
+    assert!(output.status.success(), "status failed: {output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("voicebox"),
+        "the report must show the requested unit: {stdout}"
+    );
+}
+
+#[test]
+fn status_project_with_no_units_exits_successfully() {
+    let root = TestDir::new("status-project-empty");
+    let proj_a = root.path().join("projA");
+    let proj_b = root.path().join("projB");
+    let home = root.path().join("home");
+    let target = home.join(".config").join("containers").join("systemd");
+    let bin = root.path().join("bin");
+    let log = root.path().join("systemctl.log");
+    fs::create_dir_all(&proj_a).expect("failed to create projA");
+    fs::create_dir_all(&proj_b).expect("failed to create projB");
+    fs::create_dir_all(&target).expect("failed to create target");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+
+    // projA has no quadlets; projB's unit is linked in the shared target dir.
+    let bravo = proj_b.join("bravo.container");
+    write_file(&bravo, "[Container]\nImage=example\n");
+    symlink(&bravo, target.join("bravo.container")).expect("failed to link bravo");
+
+    let path = prepend_path(&bin);
+    let scoped = run_qctl_with_path(&home, &proj_a, Path::new(&path), &["status", "--project"]);
+    assert!(
+        scoped.status.success(),
+        "status --project with no units must succeed: {scoped:?}"
+    );
+    let scoped_stdout = String::from_utf8_lossy(&scoped.stdout);
+    assert!(
+        !scoped_stdout.contains("bravo"),
+        "status --project must not leak another project's unit: {scoped_stdout}"
+    );
+
+    // Contrast guard: without the flag the same command still reports projB.
+    let wide = run_qctl_with_path(&home, &proj_a, Path::new(&path), &["status"]);
+    assert!(wide.status.success(), "status failed: {wide:?}");
+    let wide_stdout = String::from_utf8_lossy(&wide.stdout);
+    assert!(
+        wide_stdout.contains("bravo"),
+        "the default wide view must still report projB: {wide_stdout}"
     );
 }

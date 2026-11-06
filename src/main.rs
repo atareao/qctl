@@ -73,9 +73,15 @@ enum Commands {
     Status {
         /// Service name, with or without .container extension
         service: Option<String>,
-        /// Compact output format for scripts
+        /// Script-friendly output: one undecorated TSV line per unit as
+        /// `<unit>\t<linked|missing>\t<running|stopped|->`, with no emoji,
+        /// colour or `Summary:` block
         #[arg(long)]
         compact: bool,
+        /// Restrict the report to the current project's quadlets instead of
+        /// every unit found in the target directory
+        #[arg(long)]
+        project: bool,
     },
     /// Interactive table to start, stop, restart or inspect services
     Menu {
@@ -170,8 +176,17 @@ async fn main() -> Result<()> {
             status(&ctx, service, false, TargetScope::Project).await?;
         }
         Commands::Update { service } => update(&ctx, service).await?,
-        Commands::Status { service, compact } => {
-            status(&ctx, service, compact, TargetScope::Wide).await?
+        Commands::Status {
+            service,
+            compact,
+            project,
+        } => {
+            let scope = if project {
+                TargetScope::Project
+            } else {
+                TargetScope::Wide
+            };
+            status(&ctx, service, compact, scope).await?
         }
         Commands::Menu { service } => menu(&ctx, service).await?,
         Commands::CleanVolumes { yes } => clean_volumes(&ctx, yes).await?,
@@ -340,14 +355,13 @@ async fn uninstall(ctx: &AppContext) -> Result<()> {
             continue;
         }
 
-        if ext == "container" {
-            if ctx.dry_run {
-                println!("DRY-RUN systemctl --user stop {}", systemd_unit(&stem));
-            } else {
-                match systemctl_user("stop", &stem, ctx.timeout).await {
-                    Ok(()) => debug!("Stopped {stem} (if running)"),
-                    Err(err) => warn!("failed to stop {stem} (continuing): {err:#}"),
-                }
+        let unit = generated_unit(&stem, ext);
+        if ctx.dry_run {
+            println!("DRY-RUN systemctl --user stop {unit}");
+        } else {
+            match systemctl_user("stop", &unit, ctx.timeout).await {
+                Ok(()) => debug!("Stopped {unit} (if running)"),
+                Err(err) => warn!("failed to stop {unit} (continuing): {err:#}"),
             }
         }
 
@@ -706,7 +720,11 @@ async fn status(
     let targets = resolve_targets(ctx, service, scope).await?;
 
     if targets.is_empty() {
-        println!("No container units found in {}", ctx.source_display());
+        // The machine contract is "one line per unit and nothing else": with
+        // no units, compact prints nothing at all instead of a prose notice.
+        if !compact {
+            println!("No container units found in {}", ctx.source_display());
+        }
         return Ok(());
     }
 
@@ -764,18 +782,27 @@ async fn status(
             stopped_count += 1;
         }
 
-        let link_color = if linked { Color::Green } else { Color::Red };
-        let state_color = if running {
-            Color::Green
-        } else if linked {
-            Color::Yellow
-        } else {
-            Color::DarkGrey
-        };
-
         if compact {
-            println!("{}\t{}\t{}", unit, link_txt, state_txt);
+            // Machine contract: one undecorated TSV line per unit.
+            let link = if linked { "linked" } else { "missing" };
+            let state = if running {
+                "running"
+            } else if linked {
+                "stopped"
+            } else {
+                "-"
+            };
+            println!("{unit}\t{link}\t{state}");
         } else {
+            let link_color = if linked { Color::Green } else { Color::Red };
+            let state_color = if running {
+                Color::Green
+            } else if linked {
+                Color::Yellow
+            } else {
+                Color::DarkGrey
+            };
+
             table.add_row(vec![
                 Cell::new(index + 1),
                 Cell::new(link_txt).fg(link_color),
@@ -1405,6 +1432,23 @@ fn systemd_unit(unit: &str) -> String {
     }
 }
 
+/// Maps a quadlet file's stem (its name without the extension) and its
+/// extension to the systemd user unit the quadlet generator derives from it.
+/// The mapping is explicit and never relies on `systemd_unit`'s "already has a
+/// dot" heuristic, so a stem that itself contains dots (`voicebox.prod`) still
+/// gets the right suffix: `.container` becomes `<stem>.service`, the
+/// generator-suffixed types become `<stem>-<ext>.service`, and raw unit
+/// quadlets (`.service`, `.socket`, `.mount`) keep their own name.
+fn generated_unit(stem: &str, ext: &str) -> String {
+    match ext {
+        "container" => format!("{stem}.service"),
+        "volume" | "network" | "pod" | "kube" | "image" | "build" | "artifact" => {
+            format!("{stem}-{ext}.service")
+        }
+        _ => format!("{stem}.{ext}"),
+    }
+}
+
 /// Waits for a spawned child, applying `timeout` when it is set.
 ///
 /// `None` waits without limit. On expiry the error names the command together
@@ -1549,6 +1593,23 @@ mod tests {
         assert_eq!(systemd_unit("voicebox"), "voicebox.service");
         assert_eq!(systemd_unit("voicebox.service"), "voicebox.service");
         assert_eq!(systemd_unit("voicebox.container"), "voicebox.container");
+    }
+
+    #[test]
+    fn generated_unit_maps_each_quadlet_type() {
+        assert_eq!(generated_unit("voicebox", "container"), "voicebox.service");
+        assert_eq!(
+            generated_unit("microbin-microbin", "volume"),
+            "microbin-microbin-volume.service"
+        );
+        assert_eq!(generated_unit("stack", "network"), "stack-network.service");
+        assert_eq!(generated_unit("raw", "socket"), "raw.socket");
+        // A stem with dots must still get the generated suffix.
+        assert_eq!(
+            generated_unit("voicebox.prod", "container"),
+            "voicebox.prod.service"
+        );
+        assert_eq!(generated_unit("a.b", "volume"), "a.b-volume.service");
     }
 
     #[test]
