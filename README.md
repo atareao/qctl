@@ -97,7 +97,7 @@ qctl start [SERVICE]
 qctl stop [SERVICE]
 qctl restart [SERVICE]
 qctl update [SERVICE]
-qctl status [SERVICE] [--compact]
+qctl status [SERVICE] [--compact] [--project]
 qctl menu [SERVICE]
 qctl clean-volumes [--yes]
 qctl check <QUADLET>
@@ -133,11 +133,13 @@ Los comandos que actúan sobre unidades (`start`, `stop`, `restart`, `update`) v
 
 `qctl` nunca borra ni reemplaza **ficheros regulares** del directorio destino: solo elimina symlinks. Si encuentra un fichero regular con el mismo nombre, avisa por stderr y lo deja intacto. Esto cubre además ejecutar `qctl` desde dentro del propio `$HOME/.config/containers/systemd` (con un `quadlets/` anidado): ya no crea auto-symlinks y se recupera de los que hubieran dejado versiones anteriores.
 
+`uninstall` detiene —antes de borrar cada symlink— la unidad systemd que el generador de quadlets deriva de ese fichero, **sea cual sea su tipo**: `<stem>.service` para un `.container`, `<stem>-volume.service` para un `.volume` y `<stem>-network.service` para un `.network`. Así no deja unidades fantasma activas (p. ej. una `*-volume.service` que se quedaba en `not-found`). Los ficheros regulares nunca se detienen.
+
 ### Alcance de los comandos de unidad
 
 `start`, `stop` y `restart` **sin argumentos** actúan solo sobre los quadlets del proyecto actual: los que hay en `./quadlets/` y en el directorio de trabajo. No alcanzan las unidades que otros proyectos hayan enlazado en el mismo `$HOME/.config/containers/systemd`. Con dos proyectos enlazados en el mismo `HOME`, `cd proyectoA && qctl stop` no toca los servicios de `proyectoB`. La tabla que estos comandos imprimen al terminar refleja ese mismo conjunto.
 
-`status` y `menu` son consultas y sí muestran **todo** el directorio destino, vengan las unidades del proyecto que vengan, para que veas de un vistazo qué hay instalado en el `HOME`.
+`status` y `menu` son consultas y sí muestran **todo** el directorio destino, vengan las unidades del proyecto que vengan, para que veas de un vistazo qué hay instalado en el `HOME`. `status` acepta además el flag `--project` para acotar el informe al proyecto actual (el mismo alcance que `start`/`stop`/`restart` sin argumentos); sin el flag mantiene la vista amplia, y `menu` no cambia.
 
 Con un nombre explícito nada cambia: `qctl stop <nombre>` se resuelve contra el proyecto y contra el directorio destino, así que una unidad instalada cuyo origen desapareció se sigue pudiendo parar por su nombre.
 
@@ -243,11 +245,16 @@ En la tabla de `status` se usan emojis para facilitar lectura rápida:
 
 El resumen final también incluye estos estados con su significado.
 
-Con `--compact`, la salida contiene solo una línea por unidad en formato tabulado:
+Con `--compact`, la salida es **TSV sin decoración**, una línea por unidad y nada más, lista para consumir desde un script:
 
 ```text
 <unit>	<link>	<state>
 ```
+
+- `<link>` es `linked` si hay symlink en el directorio destino, `missing` si no.
+- `<state>` es `running` si la unidad enlazada está activa en `systemd --user`, `stopped` si está enlazada pero inactiva, y `-` si no está enlazada.
+
+No hay emojis, color ni bloque `Summary:` en modo compacto. El conjunto de unidades y el código de salida son idénticos a los de la tabla humana.
 
 ## Estructura esperada
 
