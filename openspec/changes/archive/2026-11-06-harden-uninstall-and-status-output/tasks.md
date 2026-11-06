@@ -34,8 +34,8 @@
 
 - [x] 4.1 `openspec validate harden-uninstall-and-status-output --strict` en verde.
 - [x] 4.2 `cargo test` completo en verde.
-- [ ] 4.3 Auditoría con `@rust-reviewer`: cerrar bloqueantes, mayores y menores hasta LISTO PARA MERGE.
-- [ ] 4.4 PR contra `develop`, CI verde, merge y `openspec archive harden-uninstall-and-status-output`.
+- [x] 4.3 Auditoría con `@rust-reviewer`: cerrar bloqueantes, mayores y menores hasta LISTO PARA MERGE.
+- [x] 4.4 PR contra `develop`, CI verde, merge y `openspec archive harden-uninstall-and-status-output`.
 - [ ] 4.5 Añadir los eventos a `CHANGELOG.md`/release según `CONTRIBUTING.md` y comprobar que no quedan PRs abiertos ni tareas sin marcar.
 
 ## 5. Ronda de correcciones post-auditoría (A–D)
