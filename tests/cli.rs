@@ -2248,3 +2248,578 @@ fn status_project_with_no_units_exits_successfully() {
         "the default wide view must still report projB: {wide_stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// consolidate-stack-management: global collision guard on `install` and the
+// stacks-root audit of `check` (openspec/changes/consolidate-stack-management).
+//
+// A "stack" is a subdirectory of the stacks root; the default root is
+// `$HOME/.config/containers/available`, overridden here with `--stacks-root`
+// so every test stays hermetic and never touches the real HOME.
+// ---------------------------------------------------------------------------
+
+/// Materialises a stacks root under `root/available`, creating one directory
+/// per stack and one file per `(name, content)` pair. Returns the stacks root
+/// so tests can point `--stacks-root` at it and use one of its stacks as the
+/// working directory.
+fn stacks_root_with(root: &Path, stacks: &[(&str, &[(&str, &str)])]) -> PathBuf {
+    let stacks_root = root.join("available");
+    for (stack, files) in stacks {
+        let stack_dir = stacks_root.join(stack);
+        fs::create_dir_all(&stack_dir).expect("failed to create stack dir");
+        for (name, content) in *files {
+            write_file(&stack_dir.join(name), content);
+        }
+    }
+    stacks_root
+}
+
+/// Prepares the fake-`systemctl` scaffolding shared by the `install` tests and
+/// returns `(home, bin_path, systemctl_log)`.
+fn install_sandbox(root: &Path) -> (PathBuf, String, PathBuf) {
+    let home = root.join("home");
+    let bin = root.join("bin");
+    let log = root.join("systemctl.log");
+    fs::create_dir_all(&home).expect("failed to create home");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &log);
+    (home, prepend_path(&bin), log)
+}
+
+#[test]
+fn install_aborts_on_basename_collision() {
+    let root = TestDir::new("install-basename-collision");
+    let (home, path, _log) = install_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[
+            ("alpha", &[("x.container", "[Container]\nImage=alpha\n")]),
+            ("bravo", &[("x.container", "[Container]\nImage=bravo\n")]),
+        ],
+    );
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+    let cwd = stacks.join("bravo");
+
+    let output = run_qctl_with_path(
+        &home,
+        &cwd,
+        Path::new(&path),
+        &["install", "--stacks-root", stacks_arg],
+    );
+
+    assert!(
+        !output.status.success(),
+        "install must abort when two stacks declare the same unit basename: {output:?}"
+    );
+    let target = home.join(".config").join("containers").join("systemd");
+    assert!(
+        symlinks_under(&target).is_empty(),
+        "a collision must abort atomically, leaving no symlink behind: {:?}",
+        symlinks_under(&target)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("x.container"),
+        "install must report the colliding basename: {stderr}"
+    );
+}
+
+#[test]
+fn install_aborts_on_containername_collision() {
+    let root = TestDir::new("install-containername-collision");
+    let (home, path, _log) = install_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[
+            (
+                "alpha",
+                &[(
+                    "a.container",
+                    "[Container]\nImage=alpha\nContainerName=foo\n",
+                )],
+            ),
+            (
+                "bravo",
+                &[(
+                    "b.container",
+                    "[Container]\nImage=bravo\nContainerName=foo\n",
+                )],
+            ),
+        ],
+    );
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+    let cwd = stacks.join("bravo");
+
+    let output = run_qctl_with_path(
+        &home,
+        &cwd,
+        Path::new(&path),
+        &["install", "--stacks-root", stacks_arg],
+    );
+
+    assert!(
+        !output.status.success(),
+        "install must abort when two quadlets share a ContainerName: {output:?}"
+    );
+    let target = home.join(".config").join("containers").join("systemd");
+    assert!(
+        symlinks_under(&target).is_empty(),
+        "a ContainerName collision must abort atomically, leaving no symlink behind: {:?}",
+        symlinks_under(&target)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("foo"),
+        "install must report the colliding ContainerName: {stderr}"
+    );
+}
+
+#[test]
+fn install_without_collision_links_normally() {
+    let root = TestDir::new("install-no-collision");
+    let (home, path, log) = install_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[
+            ("alpha", &[("a.container", "[Container]\nImage=alpha\n")]),
+            ("bravo", &[("b.container", "[Container]\nImage=bravo\n")]),
+        ],
+    );
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+    let cwd = stacks.join("bravo");
+
+    let output = run_qctl_with_path(
+        &home,
+        &cwd,
+        Path::new(&path),
+        &["install", "--stacks-root", stacks_arg],
+    );
+    assert!(
+        output.status.success(),
+        "install must succeed when nothing collides: {output:?}"
+    );
+
+    let target = home.join(".config").join("containers").join("systemd");
+    let link = target.join("b.container");
+    assert_eq!(
+        fs::read_link(&link).expect("install must link the current stack's quadlet"),
+        cwd.join("b.container")
+    );
+    assert!(
+        !target.join("a.container").exists(),
+        "install must not link another stack's quadlet"
+    );
+    assert!(
+        fs::read_to_string(&log)
+            .expect("missing systemctl log")
+            .contains("--user daemon-reload"),
+        "install must reload systemd as before"
+    );
+}
+
+#[test]
+fn check_no_args_clean_stacks_root_exits_zero() {
+    let root = TestDir::new("check-clean");
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).expect("failed to create home");
+    let stacks = stacks_root_with(
+        root.path(),
+        &[
+            (
+                "alpha",
+                &[("alpha.container", "[Container]\nImage=alpha\n")],
+            ),
+            (
+                "bravo",
+                &[("bravo.container", "[Container]\nImage=bravo\n")],
+            ),
+        ],
+    );
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl(&home, root.path(), &["check", "--stacks-root", stacks_arg]);
+
+    assert!(
+        output.status.success(),
+        "check must exit 0 on a clean stacks root: {output:?}"
+    );
+}
+
+#[test]
+fn check_no_args_hard_collision_exits_nonzero() {
+    let root = TestDir::new("check-collision");
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).expect("failed to create home");
+    let stacks = stacks_root_with(
+        root.path(),
+        &[
+            ("alpha", &[("x.container", "[Container]\nImage=alpha\n")]),
+            ("bravo", &[("x.container", "[Container]\nImage=bravo\n")]),
+        ],
+    );
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl(&home, root.path(), &["check", "--stacks-root", stacks_arg]);
+
+    assert!(
+        !output.status.success(),
+        "check must exit non-zero on a hard basename collision: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("x.container"),
+        "check must report the colliding basename: {stderr}"
+    );
+}
+
+#[test]
+fn check_no_args_naming_warning_does_not_fail() {
+    let root = TestDir::new("check-naming-warning");
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).expect("failed to create home");
+    // `weird.container` lives in stack `alpha`, so it is neither
+    // `<stack>.<ext>` nor `<stack>-<role>`: a naming warning, not a collision.
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "alpha",
+            &[("weird.container", "[Container]\nImage=weird\n")],
+        )],
+    );
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl(&home, root.path(), &["check", "--stacks-root", stacks_arg]);
+
+    assert!(
+        output.status.success(),
+        "a naming-convention warning must not fail the audit: {output:?}"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("weird"),
+        "the audit must warn about the off-convention unit: {combined}"
+    );
+}
+
+#[test]
+fn check_with_arg_still_validates_single_quadlet() {
+    let root = TestDir::new("check-single");
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).expect("failed to create home");
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "alpha",
+            &[("alpha.container", "[Container]\nImage=example\n")],
+        )],
+    );
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+    let quadlet = stacks.join("alpha").join("alpha.container");
+    let quadlet_arg = quadlet.to_str().expect("quadlet path must be utf8");
+    // Hermetic: a stub generator instead of the host's `/usr/lib/podman/quadlet`,
+    // injected through `QCTL_QUADLET_BIN`.
+    let quadlet_bin = fake_quadlet(&root.path().join("bin"), 0);
+
+    let output = run_qctl_with_quadlet_bin(
+        &home,
+        root.path(),
+        &quadlet_bin,
+        &["check", quadlet_arg, "--stacks-root", stacks_arg],
+    );
+
+    assert!(
+        output.status.success(),
+        "check <QUADLET> must still validate a single file: {output:?}"
+    );
+}
+
+/// Writes an executable stub named `quadlet` that exits with `code`, so `check`
+/// tests can point `QCTL_QUADLET_BIN` at it instead of the host's real
+/// `/usr/lib/podman/quadlet` and stay hermetic.
+fn fake_quadlet(bin: &Path, code: i32) -> PathBuf {
+    fs::create_dir_all(bin).expect("failed to create bin dir");
+    let path = bin.join("quadlet");
+    write_file(&path, &format!("#!/bin/sh\nexit {code}\n"));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .expect("failed to chmod fake quadlet");
+    path
+}
+
+/// Runs qctl with `QCTL_QUADLET_BIN` pointing at a stub generator.
+fn run_qctl_with_quadlet_bin(home: &Path, cwd: &Path, quadlet_bin: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_qctl"))
+        .args(args)
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("USER", "qctl-test")
+        .env("QCTL_QUADLET_BIN", quadlet_bin)
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("failed to run qctl")
+}
+
+#[test]
+fn check_with_arg_propagates_generator_failure() {
+    let root = TestDir::new("check-single-fail");
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).expect("failed to create home");
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "alpha",
+            &[("alpha.container", "[Container]\nImage=example\n")],
+        )],
+    );
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+    let quadlet = stacks.join("alpha").join("alpha.container");
+    let quadlet_arg = quadlet.to_str().expect("quadlet path must be utf8");
+    let quadlet_bin = fake_quadlet(&root.path().join("bin"), 1);
+
+    let output = run_qctl_with_quadlet_bin(
+        &home,
+        root.path(),
+        &quadlet_bin,
+        &["check", quadlet_arg, "--stacks-root", stacks_arg],
+    );
+
+    assert!(
+        !output.status.success(),
+        "a failing generator must fail `check <QUADLET>`: {output:?}"
+    );
+}
+
+#[test]
+fn check_no_args_containername_collision_within_same_stack_exits_nonzero() {
+    let root = TestDir::new("check-containername-same-stack");
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).expect("failed to create home");
+    // Both quadlets live in the SAME stack but declare the same ContainerName,
+    // which Podman requires to be globally unique: a hard collision.
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "alpha",
+            &[
+                (
+                    "a.container",
+                    "[Container]\nImage=alpha\nContainerName=foo\n",
+                ),
+                (
+                    "b.container",
+                    "[Container]\nImage=beta\nContainerName=foo\n",
+                ),
+            ],
+        )],
+    );
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl(&home, root.path(), &["check", "--stacks-root", stacks_arg]);
+
+    assert!(
+        !output.status.success(),
+        "two quadlets in the same stack sharing a ContainerName must fail the audit: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("foo"),
+        "check must report the colliding ContainerName: {stderr}"
+    );
+}
+
+#[test]
+fn install_aborts_on_containername_collision_within_same_stack() {
+    let root = TestDir::new("install-containername-same-stack");
+    let (home, path, _log) = install_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "alpha",
+            &[
+                (
+                    "a.container",
+                    "[Container]\nImage=alpha\nContainerName=foo\n",
+                ),
+                (
+                    "b.container",
+                    "[Container]\nImage=beta\nContainerName=foo\n",
+                ),
+            ],
+        )],
+    );
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+    let cwd = stacks.join("alpha");
+
+    let output = run_qctl_with_path(
+        &home,
+        &cwd,
+        Path::new(&path),
+        &["install", "--stacks-root", stacks_arg],
+    );
+
+    assert!(
+        !output.status.success(),
+        "install must abort when two quadlets in the same stack share a ContainerName: {output:?}"
+    );
+    let target = home.join(".config").join("containers").join("systemd");
+    assert!(
+        symlinks_under(&target).is_empty(),
+        "a ContainerName collision must abort atomically, leaving no symlink behind: {:?}",
+        symlinks_under(&target)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("foo"),
+        "install must report the colliding ContainerName: {stderr}"
+    );
+}
+
+#[test]
+fn check_warns_when_quadlet_is_unreadable() {
+    let root = TestDir::new("check-unreadable-quadlet");
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).expect("failed to create home");
+    // Convention-compliant basenames, so the only possible warning is the one
+    // about the unreadable file: a naming warning must not mask the failure.
+    let stacks = stacks_root_with(
+        root.path(),
+        &[
+            (
+                "alpha",
+                &[(
+                    "alpha.container",
+                    "[Container]\nImage=alpha\nContainerName=foo\n",
+                )],
+            ),
+            (
+                "bravo",
+                &[(
+                    "bravo.container",
+                    "[Container]\nImage=bravo\nContainerName=foo\n",
+                )],
+            ),
+        ],
+    );
+    let unreadable = stacks.join("bravo").join("bravo.container");
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+        .expect("failed to chmod unreadable quadlet");
+
+    // Running as root defeats the permission bit, so the premise does not hold:
+    // skip rather than assert something false.
+    if fs::read_to_string(&unreadable).is_ok() {
+        eprintln!("skipping: this user can read a 0o000 file (running as root?)");
+        return;
+    }
+
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+    let output = run_qctl(&home, root.path(), &["check", "--stacks-root", stacks_arg]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bravo.container"),
+        "an unreadable quadlet must be surfaced, not swallowed silently: {stderr}"
+    );
+}
+
+#[test]
+fn check_warns_when_stacks_root_is_missing() {
+    let root = TestDir::new("check-missing-root");
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).expect("failed to create home");
+    let missing = root.path().join("does-not-exist");
+    let missing_arg = missing.to_str().expect("path must be utf8");
+
+    let output = run_qctl(&home, root.path(), &["check", "--stacks-root", missing_arg]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does-not-exist"),
+        "check must warn when the stacks root is unreadable instead of reporting a clean audit: {stderr}"
+    );
+}
+
+#[test]
+fn install_aborts_on_collision_from_nested_quadlets_dir() {
+    let root = TestDir::new("install-nested-quadlets");
+    let (home, path, _log) = install_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[("alpha", &[("x.container", "[Container]\nImage=alpha\n")])],
+    );
+    // `bravo` keeps its quadlets in the supported `quadlets/` subdirectory.
+    let bravo_quadlets = stacks.join("bravo").join("quadlets");
+    fs::create_dir_all(&bravo_quadlets).expect("failed to create nested quadlets dir");
+    write_file(
+        &bravo_quadlets.join("x.container"),
+        "[Container]\nImage=bravo\n",
+    );
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &bravo_quadlets,
+        Path::new(&path),
+        &["install", "--stacks-root", stacks_arg],
+    );
+
+    assert!(
+        !output.status.success(),
+        "install from a nested quadlets/ dir must still enforce the global guard: {output:?}"
+    );
+    let target = home.join(".config").join("containers").join("systemd");
+    assert!(
+        symlinks_under(&target).is_empty(),
+        "a collision must abort atomically, leaving no symlink behind: {:?}",
+        symlinks_under(&target)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("x.container"),
+        "install must report the colliding basename: {stderr}"
+    );
+}
+
+#[test]
+fn install_guard_does_not_apply_outside_stacks_root() {
+    let root = TestDir::new("install-outside-root");
+    let (home, path, log) = install_sandbox(root.path());
+    // A hard collision exists inside the stacks root, but this install runs from
+    // a directory outside it, so the global guard must not apply.
+    let stacks = stacks_root_with(
+        root.path(),
+        &[
+            ("alpha", &[("x.container", "[Container]\nImage=alpha\n")]),
+            ("bravo", &[("x.container", "[Container]\nImage=bravo\n")]),
+        ],
+    );
+    let work = root.path().join("work");
+    fs::create_dir_all(&work).expect("failed to create work dir");
+    write_file(&work.join("w.container"), "[Container]\nImage=work\n");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &work,
+        Path::new(&path),
+        &["install", "--stacks-root", stacks_arg],
+    );
+
+    assert!(
+        output.status.success(),
+        "the guard must not abort installs from outside the stacks root: {output:?}"
+    );
+    let target = home.join(".config").join("containers").join("systemd");
+    assert!(
+        target.join("w.container").exists(),
+        "install must link the current project's quadlet"
+    );
+    assert!(
+        fs::read_to_string(&log)
+            .expect("missing systemctl log")
+            .contains("--user daemon-reload"),
+        "install must reload systemd as before"
+    );
+}

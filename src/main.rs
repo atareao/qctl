@@ -37,6 +37,10 @@ struct Cli {
     /// Timeout in seconds for external commands; 0 disables the limit
     #[arg(long, global = true, value_name = "SECONDS", default_value_t = 60)]
     timeout: u64,
+    /// Root directory holding one directory per stack
+    /// (defaults to `$HOME/.config/containers/available`)
+    #[arg(long, global = true, value_name = "DIR")]
+    stacks_root: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -94,10 +98,11 @@ enum Commands {
         #[arg(short, long)]
         yes: bool,
     },
-    /// Check one quadlet file with /usr/lib/podman/quadlet
+    /// Validate one quadlet file, or audit the whole stacks root when called
+    /// without an argument
     Check {
-        /// Quadlet file path
-        quadlet: String,
+        /// Quadlet file path; omit to audit every stack under the stacks root
+        quadlet: Option<String>,
     },
     /// Show logs in follow mode for a service since last hour
     Logs {
@@ -122,6 +127,11 @@ enum Commands {
 struct AppContext {
     source_dirs: Vec<PathBuf>,
     target_dir: PathBuf,
+    /// Directory the process was started from, used to locate the current stack
+    /// inside the stacks root.
+    current_dir: PathBuf,
+    /// Root directory holding one directory per stack.
+    stacks_root: PathBuf,
     user: String,
     dry_run: bool,
     /// Deadline applied to bounded external commands; `None` waits forever.
@@ -148,7 +158,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let ctx = AppContext::new(cli.dry_run, cli.timeout)?;
+    let ctx = AppContext::new(cli.dry_run, cli.timeout, cli.stacks_root)?;
 
     match cli.command {
         Commands::Install => {
@@ -190,7 +200,10 @@ async fn main() -> Result<()> {
         }
         Commands::Menu { service } => menu(&ctx, service).await?,
         Commands::CleanVolumes { yes } => clean_volumes(&ctx, yes).await?,
-        Commands::Check { quadlet } => check_quadlet(&ctx, quadlet).await?,
+        Commands::Check { quadlet } => match quadlet {
+            Some(quadlet) => check_quadlet(&ctx, quadlet).await?,
+            None => audit_stacks_root(&ctx).await?,
+        },
         Commands::Logs { service } => logs(service, false).await?,
         Commands::Logsf { service } => logs(service, true).await?,
         Commands::Reload => daemon_reload(&ctx).await?,
@@ -201,12 +214,14 @@ async fn main() -> Result<()> {
 }
 
 impl AppContext {
-    fn new(dry_run: bool, timeout_secs: u64) -> Result<Self> {
+    fn new(dry_run: bool, timeout_secs: u64, stacks_root: Option<PathBuf>) -> Result<Self> {
         let root_dir = std::env::current_dir().context("failed to resolve current directory")?;
         let source_dirs = discover_source_dirs(&root_dir);
 
         let home = std::env::var("HOME").context("HOME is not set")?;
         let target_dir = Path::new(&home).join(".config/containers/systemd");
+        let stacks_root =
+            stacks_root.unwrap_or_else(|| Path::new(&home).join(".config/containers/available"));
 
         let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
 
@@ -221,6 +236,8 @@ impl AppContext {
         Ok(Self {
             source_dirs,
             target_dir,
+            current_dir: root_dir,
+            stacks_root,
             user,
             dry_run,
             timeout,
@@ -242,6 +259,10 @@ async fn install(ctx: &AppContext) -> Result<()> {
         ctx.source_display(),
         ctx.target_dir.display()
     );
+
+    // Refuse the whole install, before touching the filesystem, when the current
+    // stack's units collide with another stack under the stacks root.
+    ensure_no_global_collision(ctx).await?;
 
     if ctx.dry_run {
         println!("DRY-RUN create {}", ctx.target_dir.display());
@@ -1106,13 +1127,300 @@ fn confirm_clean_volumes(volume_names: &[String]) -> Result<bool> {
 
 async fn check_quadlet(ctx: &AppContext, quadlet: String) -> Result<()> {
     debug!("Checking {quadlet}");
+    // The generator path is overridable so tests (and unusual hosts) can point
+    // at their own binary instead of the distro default.
+    let bin =
+        std::env::var("QCTL_QUADLET_BIN").unwrap_or_else(|_| "/usr/lib/podman/quadlet".to_string());
     run_command(
-        "/usr/lib/podman/quadlet",
+        &bin,
         &["-dryrun", "-user", &ctx.user, &quadlet],
         false,
         ctx.timeout,
     )
     .await?;
+    Ok(())
+}
+
+/// A quadlet discovered while scanning a stack: which stack owns it, its file
+/// basename and the `ContainerName=` it declares, if any.
+struct StackUnit {
+    stack: String,
+    basename: String,
+    container_name: Option<String>,
+}
+
+/// Cross-stack problems found while auditing a stacks root.
+struct AuditFindings {
+    /// Unit basenames declared by two or more stacks, with the stacks involved.
+    basename_collisions: Vec<(String, Vec<String>)>,
+    /// `ContainerName=` values declared by two or more quadlets, with the stacks
+    /// involved.
+    containername_collisions: Vec<(String, Vec<String>)>,
+    /// Units whose basename is neither `<stack>.<ext>` nor `<stack>-<role>`.
+    naming_warnings: Vec<(String, String)>,
+}
+
+impl AuditFindings {
+    fn has_hard_collision(&self) -> bool {
+        !self.basename_collisions.is_empty() || !self.containername_collisions.is_empty()
+    }
+}
+
+/// Scans every stack directory directly under `root`, collecting one `StackUnit`
+/// per quadlet file. A missing or unreadable root yields an empty list: there is
+/// nothing to audit, which is the safe default for both `install` and `check`
+/// (the audit path warns about an unreadable root separately).
+///
+/// Individual failures never abort the scan: an unreadable file or an invalid
+/// filename is reported with `warn!` and skipped, so one bad quadlet cannot hide
+/// the rest of the audit (and cannot silently vanish either).
+async fn scan_stacks_root(root: &Path) -> Result<Vec<StackUnit>> {
+    let mut units = Vec::new();
+    let Ok(mut stacks) = fs::read_dir(root).await else {
+        return Ok(units);
+    };
+
+    while let Some(entry) = stacks.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let stack = entry.file_name().to_string_lossy().to_string();
+
+        for dir in stack_quadlet_dirs(&entry.path()) {
+            let mut files = match fs::read_dir(&dir).await {
+                Ok(files) => files,
+                Err(e) => {
+                    warn!("cannot read stack directory {}: {e}", dir.display());
+                    continue;
+                }
+            };
+            while let Some(file) = files.next_entry().await? {
+                let path = file.path();
+                let Some(ext) = extension_of_path(&path) else {
+                    continue;
+                };
+                if !QUADLET_EXTENSIONS.contains(&ext) {
+                    continue;
+                }
+
+                let basename = match basename(&path) {
+                    Ok(name) => name,
+                    Err(e) => {
+                        warn!(
+                            "skipping quadlet with an invalid name {}: {e}",
+                            path.display()
+                        );
+                        continue;
+                    }
+                };
+                let content = match fs::read_to_string(&path).await {
+                    Ok(content) => content,
+                    Err(e) => {
+                        warn!("cannot read quadlet {}: {e}", path.display());
+                        continue;
+                    }
+                };
+
+                units.push(StackUnit {
+                    stack: stack.clone(),
+                    basename,
+                    container_name: parse_container_name(&content),
+                });
+            }
+        }
+    }
+
+    Ok(units)
+}
+
+/// Directories under one stack that may hold quadlets: the optional nested
+/// `quadlets/` subdirectory (mirroring `discover_source_dirs`), then the stack
+/// directory itself.
+fn stack_quadlet_dirs(stack_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::with_capacity(2);
+    let nested = stack_dir.join("quadlets");
+    if nested.is_dir() {
+        dirs.push(nested);
+    }
+    dirs.push(stack_dir.to_path_buf());
+    dirs
+}
+
+/// Classifies the cross-stack problems in a set of scanned units: hard
+/// collisions (a duplicated basename or `ContainerName=`) and naming-convention
+/// drift.
+fn analyze_units(units: &[StackUnit]) -> AuditFindings {
+    let mut basename_quadlets: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+    let mut containername_quadlets: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+    let mut naming_warnings = Vec::new();
+
+    for unit in units {
+        // Identify each declaring quadlet by `(stack, basename)`: `ContainerName=`
+        // must be unique in Podman globally, so two quadlets of the *same* stack
+        // collide too, not only quadlets in different stacks.
+        let quadlet = (unit.stack.as_str(), unit.basename.as_str());
+        basename_quadlets
+            .entry(unit.basename.as_str())
+            .or_default()
+            .push(quadlet);
+
+        if let Some(name) = unit.container_name.as_deref() {
+            containername_quadlets
+                .entry(name)
+                .or_default()
+                .push(quadlet);
+        }
+
+        let stem = strip_dot_extension(&unit.basename);
+        if stem != unit.stack && !stem.starts_with(&format!("{}-", unit.stack)) {
+            naming_warnings.push((unit.basename.clone(), unit.stack.clone()));
+        }
+    }
+
+    let basename_collisions = collect_collisions(basename_quadlets);
+    let containername_collisions = collect_collisions(containername_quadlets);
+    naming_warnings.sort();
+
+    AuditFindings {
+        basename_collisions,
+        containername_collisions,
+        naming_warnings,
+    }
+}
+
+/// Keeps only the entries declared by two or more *distinct quadlets* — keyed by
+/// `(stack, basename)`, never deduplicated down to stacks — returning the sorted,
+/// deduplicated stacks involved.
+fn collect_collisions(groups: HashMap<&str, Vec<(&str, &str)>>) -> Vec<(String, Vec<String>)> {
+    let mut collisions: Vec<(String, Vec<String>)> = groups
+        .into_iter()
+        .filter_map(|(name, quadlets)| {
+            let mut quadlets = quadlets;
+            quadlets.sort_unstable();
+            quadlets.dedup();
+            if quadlets.len() < 2 {
+                return None;
+            }
+            let mut stacks: Vec<String> = quadlets
+                .into_iter()
+                .map(|(stack, _)| stack.to_string())
+                .collect();
+            stacks.sort();
+            stacks.dedup();
+            Some((name.to_string(), stacks))
+        })
+        .collect();
+    collisions.sort();
+    collisions
+}
+
+/// Name of the stack the process is running from, when the current directory is
+/// a stack directory under the stacks root. A stack may keep its quadlets in a
+/// nested `quadlets/` directory, so running from `available/<stack>/quadlets`
+/// also resolves to `<stack>`. `None` means the caller is not installing a stack
+/// from the root, so the global guard does not apply.
+async fn current_stack_name(ctx: &AppContext) -> Option<String> {
+    let root = fs::canonicalize(&ctx.stacks_root).await.ok()?;
+    // A nested `quadlets/` directory belongs to its parent stack.
+    let stack_dir = if ctx.current_dir.file_name().and_then(|n| n.to_str()) == Some("quadlets") {
+        ctx.current_dir.parent()?.to_path_buf()
+    } else {
+        ctx.current_dir.clone()
+    };
+    let parent = fs::canonicalize(stack_dir.parent()?).await.ok()?;
+    if parent != root {
+        return None;
+    }
+    stack_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+}
+
+/// Audits the stacks root without touching anything: hard collisions and naming
+/// warnings go to stderr, and at least one hard collision fails the command.
+/// Warnings alone never fail.
+async fn audit_stacks_root(ctx: &AppContext) -> Result<()> {
+    if let Err(e) = fs::read_dir(&ctx.stacks_root).await {
+        warn!(
+            "stacks root {} is not readable; nothing to audit: {e}",
+            ctx.stacks_root.display()
+        );
+    }
+
+    let units = scan_stacks_root(&ctx.stacks_root).await?;
+    let findings = analyze_units(&units);
+
+    for (name, stacks) in &findings.basename_collisions {
+        warn!(
+            "collision: unit basename '{name}' is declared by stacks: {}",
+            stacks.join(", ")
+        );
+    }
+    for (name, stacks) in &findings.containername_collisions {
+        warn!(
+            "collision: ContainerName={name} is declared by stacks: {}",
+            stacks.join(", ")
+        );
+    }
+    for (name, stack) in &findings.naming_warnings {
+        warn!(
+            "naming: '{name}' in stack '{stack}' is neither '<stack>.<ext>' nor '<stack>-<role>'"
+        );
+    }
+
+    if findings.has_hard_collision() {
+        let hard = findings.basename_collisions.len() + findings.containername_collisions.len();
+        bail!(
+            "stacks root {} has {hard} hard collision(s)",
+            ctx.stacks_root.display()
+        );
+    }
+
+    debug!(
+        "Audited {} unit(s) under {}",
+        units.len(),
+        ctx.stacks_root.display()
+    );
+    Ok(())
+}
+
+/// Aborts `install` atomically when the current stack's units collide with
+/// another stack under the stacks root: the same unit basename, or the same
+/// `ContainerName=`, declared by two stacks. Runs before any filesystem change,
+/// so an abort leaves the target directory untouched.
+async fn ensure_no_global_collision(ctx: &AppContext) -> Result<()> {
+    let Some(stack) = current_stack_name(ctx).await else {
+        return Ok(());
+    };
+
+    let units = scan_stacks_root(&ctx.stacks_root).await?;
+    let findings = analyze_units(&units);
+
+    let mut problems = Vec::new();
+    for (name, stacks) in &findings.basename_collisions {
+        if stacks.iter().any(|s| s == &stack) {
+            problems.push(format!(
+                "unit basename '{name}' is declared by stacks: {}",
+                stacks.join(", ")
+            ));
+        }
+    }
+    for (name, stacks) in &findings.containername_collisions {
+        if stacks.iter().any(|s| s == &stack) {
+            problems.push(format!(
+                "ContainerName={name} is declared by stacks: {}",
+                stacks.join(", ")
+            ));
+        }
+    }
+
+    if !problems.is_empty() {
+        bail!(
+            "refusing to install stack '{stack}': global collision(s):\n{}",
+            problems.join("\n")
+        );
+    }
+
     Ok(())
 }
 
@@ -1372,20 +1680,28 @@ fn strip_dot_extension(name: &str) -> String {
         .to_string()
 }
 
+/// Returns the trimmed, non-empty value of the first `key=` line in a quadlet,
+/// or `None` when the key is absent or blank. Leading indentation is tolerated
+/// and an inline `#` comment is stripped, so `  ContainerName=foo # note` reads
+/// as `foo`.
+fn parse_ini_value(content: &str, key: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let value = line.trim_start().strip_prefix(key)?;
+        let value = value.split('#').next().unwrap_or_default().trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
 fn parse_volume_name(content: &str) -> Option<String> {
-    content
-        .lines()
-        .find_map(|line| line.strip_prefix("VolumeName="))
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    parse_ini_value(content, "VolumeName=")
+}
+
+fn parse_container_name(content: &str) -> Option<String> {
+    parse_ini_value(content, "ContainerName=")
 }
 
 fn parse_image_name(content: &str) -> Option<String> {
-    content
-        .lines()
-        .find_map(|line| line.strip_prefix("Image="))
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    parse_ini_value(content, "Image=")
 }
 
 async fn daemon_reload(ctx: &AppContext) -> Result<()> {
@@ -1623,6 +1939,22 @@ mod tests {
         assert_eq!(parse_volume_name("[Volume]\n"), None);
         assert_eq!(parse_volume_name("VolumeName=\n"), None);
         assert_eq!(parse_volume_name("VolumeName=   \n"), None);
+    }
+
+    #[test]
+    fn parse_ini_value_tolerates_indentation_and_inline_comments() {
+        assert_eq!(
+            parse_ini_value("  ContainerName=foo\n", "ContainerName=").as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            parse_ini_value("ContainerName=foo # the name\n", "ContainerName=").as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            parse_ini_value("\tImage=example:1 # pinned\n", "Image=").as_deref(),
+            Some("example:1")
+        );
     }
 
     #[test]
