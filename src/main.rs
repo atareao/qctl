@@ -1130,14 +1130,81 @@ fn confirm_clean_volumes(volume_names: &[String]) -> Result<bool> {
     Ok(matches!(input.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
+/// Returns `true` when `path` is a regular file with any execute bit set
+/// (owner, group or other).
+///
+/// This is enough to pick a generator among distro candidates: it never spawns
+/// the binary, it only checks that it is plausibly runnable.
+///
+/// Limitation: a group/other-only execute bit counts, so the file may not be
+/// runnable by the invoking user. That is acceptable for probing well-known
+/// distro paths, where the generator is a system binary shipped world-executable.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Locates the podman quadlet generator binary.
+///
+/// `env_override` (from `QCTL_QUADLET_BIN`) wins when it points at an existing
+/// executable. Otherwise the first existing, executable entry of `candidates`
+/// is returned, in order. When nothing matches, the error lists every probed
+/// path so the user can see what was tried and how to fix it.
+fn find_quadlet_bin(candidates: &[PathBuf], env_override: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = env_override.as_ref() {
+        if is_executable_file(path) {
+            return Ok(path.clone());
+        }
+        debug!(
+            "QCTL_QUADLET_BIN={} is not an executable file; falling back to candidates",
+            path.display()
+        );
+    }
+
+    for candidate in candidates {
+        if is_executable_file(candidate) {
+            return Ok(candidate.clone());
+        }
+    }
+
+    let mut probed: Vec<String> = Vec::new();
+    if let Some(override_path) = env_override {
+        probed.push(format!("QCTL_QUADLET_BIN={}", override_path.display()));
+    }
+    probed.extend(candidates.iter().map(|p| p.display().to_string()));
+
+    bail!(
+        "quadlet generator not found; probed: {}. Install podman or set QCTL_QUADLET_BIN to the generator binary.",
+        probed.join(", ")
+    )
+}
+
+/// Distro candidate paths for the podman quadlet generator, probed in order:
+/// usrmerge systems (Fedora, openSUSE) first, then Debian/Arch layouts.
+const QUADLET_BIN_CANDIDATES: &[&str] = &["/usr/libexec/podman/quadlet", "/usr/lib/podman/quadlet"];
+
+/// The [`QUADLET_BIN_CANDIDATES`] distro paths as owned [`PathBuf`]s, preserving
+/// probe order so the usrmerge layout wins when both exist.
+fn quadlet_candidates() -> Vec<PathBuf> {
+    QUADLET_BIN_CANDIDATES.iter().map(PathBuf::from).collect()
+}
+
+/// Validates a single quadlet with the podman generator.
+///
+/// The generator is located by [`find_quadlet_bin`]: the distro candidates are
+/// probed in order and `QCTL_QUADLET_BIN` overrides them, so hosts with a
+/// non-standard layout (and tests) can point at their own binary.
 async fn check_quadlet(ctx: &AppContext, quadlet: String) -> Result<()> {
     debug!("Checking {quadlet}");
-    // The generator path is overridable so tests (and unusual hosts) can point
-    // at their own binary instead of the distro default.
-    let bin =
-        std::env::var("QCTL_QUADLET_BIN").unwrap_or_else(|_| "/usr/lib/podman/quadlet".to_string());
+    let candidates = quadlet_candidates();
+    let bin = find_quadlet_bin(
+        &candidates,
+        std::env::var_os("QCTL_QUADLET_BIN").map(PathBuf::from),
+    )?;
     run_command(
-        &bin,
+        &bin.to_string_lossy(),
         &["-dryrun", "-user", &ctx.user, &quadlet],
         false,
         ctx.timeout,
@@ -2018,5 +2085,165 @@ mod tests {
         assert!(parse_menu_selection(&["0"]).is_err());
         assert!(parse_menu_selection(&["0", "r"]).is_err());
         assert!(parse_menu_selection(&["r", "0"]).is_err());
+    }
+
+    /// A scratch directory for the `find_quadlet_bin` unit tests. It lives under
+    /// the OS temp dir and is removed on drop, so the tests never touch the
+    /// host's real generator paths.
+    struct QuadletBinTestDir {
+        path: PathBuf,
+    }
+
+    impl QuadletBinTestDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "qctl-quadlet-bin-test-{}-{name}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("failed to create quadlet bin test dir");
+            Self { path }
+        }
+
+        /// Writes an executable-looking stub at `name` with the given mode and
+        /// returns its path.
+        fn file(&self, name: &str, mode: u32) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = self.path.join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("failed to write quadlet stub");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("failed to chmod quadlet stub");
+            path
+        }
+
+        /// A path inside the scratch dir that is intentionally never created.
+        fn missing(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for QuadletBinTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn find_quadlet_bin_prefers_the_env_override() {
+        let dir = QuadletBinTestDir::new("prefers-env");
+        let candidate = dir.file("candidate", 0o755);
+        let override_bin = dir.file("override", 0o755);
+
+        let found = find_quadlet_bin(&[candidate], Some(override_bin.clone()))
+            .expect("the env override must win over the candidates");
+
+        assert_eq!(found, override_bin);
+    }
+
+    #[test]
+    fn find_quadlet_bin_returns_the_first_existing_executable_candidate() {
+        let dir = QuadletBinTestDir::new("first-existing");
+        let first = dir.file("first", 0o755);
+        let missing = dir.missing("missing");
+
+        let found = find_quadlet_bin(&[first.clone(), missing.clone()], None)
+            .expect("the first executable candidate must be returned");
+        assert_eq!(found, first);
+
+        let second = dir.file("second", 0o755);
+        let found = find_quadlet_bin(&[missing, second.clone()], None)
+            .expect("a later executable candidate must be returned");
+        assert_eq!(found, second);
+    }
+
+    #[test]
+    fn find_quadlet_bin_skips_non_executable_candidates() {
+        let dir = QuadletBinTestDir::new("skips-non-executable");
+        let non_executable = dir.file("plain", 0o644);
+        let executable = dir.file("exec", 0o755);
+
+        let found = find_quadlet_bin(&[non_executable, executable.clone()], None)
+            .expect("a non-executable candidate must be skipped");
+
+        assert_eq!(found, executable);
+    }
+
+    #[test]
+    fn find_quadlet_bin_skips_a_directory_candidate() {
+        let dir = QuadletBinTestDir::new("skips-directory");
+        let as_directory = dir.path.join("dir-candidate");
+        std::fs::create_dir_all(&as_directory).expect("failed to create directory candidate");
+        let executable = dir.file("exec", 0o755);
+
+        let found = find_quadlet_bin(&[as_directory, executable.clone()], None)
+            .expect("a directory candidate must be skipped in favour of the next one");
+
+        assert_eq!(found, executable);
+    }
+
+    #[test]
+    fn find_quadlet_bin_probes_the_distro_candidates_in_order() {
+        // Contract: the usrmerge layout (`/usr/libexec/podman/quadlet`, Fedora /
+        // openSUSE) is probed before the Debian/Arch layout
+        // (`/usr/lib/podman/quadlet`). `quadlet_candidates()` mirrors that order
+        // and `find_quadlet_bin` returns the first match in it.
+        assert_eq!(
+            QUADLET_BIN_CANDIDATES,
+            &["/usr/libexec/podman/quadlet", "/usr/lib/podman/quadlet"][..]
+        );
+        assert_eq!(
+            quadlet_candidates().first(),
+            Some(&PathBuf::from("/usr/libexec/podman/quadlet")),
+            "the Fedora / usrmerge candidate must be probed first"
+        );
+
+        // The probe honours that order: with both candidates present, the first
+        // one wins. Real paths cannot be created here, so temp stubs mirror them.
+        let dir = QuadletBinTestDir::new("candidate-order");
+        let first = dir.file("usr-libexec-podman-quadlet", 0o755);
+        let second = dir.file("usr-lib-podman-quadlet", 0o755);
+        let found = find_quadlet_bin(&[first.clone(), second], None)
+            .expect("the first declared candidate must win when both exist");
+
+        assert_eq!(
+            found, first,
+            "the first of QUADLET_BIN_CANDIDATES must win when both exist"
+        );
+    }
+
+    #[test]
+    fn find_quadlet_bin_ignores_a_missing_env_override() {
+        let dir = QuadletBinTestDir::new("missing-env-override");
+        let missing_override = dir.missing("no-such-override");
+        let candidate = dir.file("candidate", 0o755);
+
+        let found = find_quadlet_bin(std::slice::from_ref(&candidate), Some(missing_override))
+            .expect("a broken env override must fall back to the candidates");
+
+        assert_eq!(found, candidate);
+    }
+
+    #[test]
+    fn find_quadlet_bin_fails_with_probed_paths_when_nothing_matches() {
+        let dir = QuadletBinTestDir::new("nothing-matches");
+        let x = dir.missing("x");
+        let y = dir.missing("y");
+
+        let err = find_quadlet_bin(&[x.clone(), y.clone()], None)
+            .expect_err("no matching candidate must yield an error");
+        let message = err.to_string();
+
+        assert!(
+            message.contains(&x.to_string_lossy().to_string()),
+            "the error must list the probed path {x:?}: {message}"
+        );
+        assert!(
+            message.contains(&y.to_string_lossy().to_string()),
+            "the error must list the probed path {y:?}: {message}"
+        );
+        assert!(
+            message.contains("QCTL_QUADLET_BIN"),
+            "the error must mention the QCTL_QUADLET_BIN override: {message}"
+        );
     }
 }

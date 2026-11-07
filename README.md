@@ -15,7 +15,7 @@ CLI en Rust para gestionar quadlets de forma simple y segura: instalación de en
 - `qctl start <servicio>` instala **solo** esa unidad si faltaba y la arranca; `qctl start` sin argumentos instala los quadlets que falten y arranca todos.
 - Muestra estado en formato visual (tabla) o compacto (ideal para scripts).
 - Limpia volúmenes de Podman declarados en archivos `.volume`.
-- Ejecuta verificación de quadlets con `/usr/lib/podman/quadlet` y, sin argumento, audita todo el stacks root (colisiones duras y avisos de convención de nombres).
+- Ejecuta verificación de quadlets con el generador de Podman (autodetectado: `/usr/libexec/podman/quadlet` y luego `/usr/lib/podman/quadlet`, o `QCTL_QUADLET_BIN`) y, sin argumento, audita todo el stacks root (colisiones duras y avisos de convención de nombres).
 - Sigue logs por servicio con `journalctl`.
 
 ## Requisitos
@@ -25,7 +25,7 @@ CLI en Rust para gestionar quadlets de forma simple y segura: instalación de en
 - `systemctl --user`
 - `podman`
 - `journalctl`
-- `/usr/lib/podman/quadlet` (la ruta del binario del generador se puede sobreescribir con la variable de entorno `QCTL_QUADLET_BIN`; por defecto es `/usr/lib/podman/quadlet`)
+- El generador de quadlets de Podman (se autodetecta en `/usr/libexec/podman/quadlet` —Fedora, openSUSE— y, si no, en `/usr/lib/podman/quadlet` —Debian, Arch—; la ruta se puede fijar con la variable de entorno `QCTL_QUADLET_BIN`)
 
 ## Instalación y compilación
 
@@ -116,7 +116,7 @@ qctl --dry-run clean-volumes
 
 Los comandos de solo consulta (`status`, `logs`, `logsf`, `check`, `completions`) siguen consultando el sistema aunque se use `--dry-run`, porque son de lectura y su utilidad desaparecería al simularlos. `qctl menu --dry-run` también sigue consultando para dibujar la tabla, pero las acciones que mutan (`start`, `stop`, `restart`) respetan `--dry-run`.
 
-`--timeout <SEGUNDOS>` limita las herramientas externas que `qctl` espera: `systemctl --user` (`start`, `stop`, `restart`, `daemon-reload`, `is-active`), `/usr/lib/podman/quadlet` y `podman volume rm`. Por defecto son **60 segundos**; `--timeout 0` desactiva el límite. Al agotarse el plazo, `qctl` termina el proceso y falla con un error que nombra el comando y la unidad.
+`--timeout <SEGUNDOS>` limita las herramientas externas que `qctl` espera: `systemctl --user` (`start`, `stop`, `restart`, `daemon-reload`, `is-active`), el generador de quadlets de Podman (autodetectado) y `podman volume rm`. Por defecto son **60 segundos**; `--timeout 0` desactiva el límite. Al agotarse el plazo, `qctl` termina el proceso y falla con un error que nombra el comando y la unidad.
 
 Dos invocaciones quedan **fuera** del plazo, a propósito:
 
@@ -185,7 +185,7 @@ Las colisiones de basename descritas arriba se detectan **dentro del primer nive
 - **`check` sin argumento** — audita cada stack del stacks root (una pasada por stack, incluyendo su subdirectorio `quadlets/` si existe) y clasifica los problemas en dos grupos:
   - **Colisiones duras** (dos o más stacks declaran el mismo basename de unidad, o el mismo `ContainerName=`): se reportan por stderr y el comando termina con **código de salida distinto de cero**. Son un fallo real que rompería el `HOME`.
   - **Avisos de convención** (un basename que no sigue `<stack>.<ext>` ni `<stack>-<rol>`): se reportan por stderr pero **no** hacen fallar el comando. Son solo un recordatorio de estilo.
-- **`check <QUADLET>`** — conserva el comportamiento previo: valida **un único** fichero con `/usr/lib/podman/quadlet`.
+- **`check <QUADLET>`** — conserva el comportamiento previo: valida **un único** fichero con el generador de Podman autodetectado.
 
 ```bash
 # Auditoría global del stacks root por defecto

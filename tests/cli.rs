@@ -43,6 +43,9 @@ fn run_qctl(home: &Path, cwd: &Path, args: &[&str]) -> Output {
         .env("HOME", home)
         .env("USER", "qctl-test")
         .env_remove("RUST_LOG")
+        // Keep the generator resolution hermetic: only tests that explicitly
+        // opt in (`run_qctl_with_quadlet_bin`) set the override.
+        .env_remove("QCTL_QUADLET_BIN")
         .output()
         .expect("failed to run qctl")
 }
@@ -2589,6 +2592,120 @@ fn check_with_arg_propagates_generator_failure() {
     assert!(
         !output.status.success(),
         "a failing generator must fail `check <QUADLET>`: {output:?}"
+    );
+}
+
+/// Writes an executable stub named `quadlet` that appends its arguments to
+/// `log` and exits 0, so `check` tests can assert the exact generator
+/// invocation without touching the host's real generator.
+fn fake_quadlet_logging(bin: &Path, log: &Path) -> PathBuf {
+    fs::create_dir_all(bin).expect("failed to create bin dir");
+    let path = bin.join("quadlet");
+    write_file(
+        &path,
+        &format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display()),
+    );
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .expect("failed to chmod fake quadlet");
+    path
+}
+
+#[test]
+fn check_still_invokes_the_stub_generator_from_env() {
+    let root = TestDir::new("check-stub-generator-log");
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).expect("failed to create home");
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "alpha",
+            &[("alpha.container", "[Container]\nImage=example\n")],
+        )],
+    );
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+    let quadlet = stacks.join("alpha").join("alpha.container");
+    let quadlet_arg = quadlet.to_str().expect("quadlet path must be utf8");
+    // Hermetic: a logging stub generator injected through `QCTL_QUADLET_BIN`.
+    let log = root.path().join("quadlet.log");
+    let quadlet_bin = fake_quadlet_logging(&root.path().join("bin"), &log);
+
+    let output = run_qctl_with_quadlet_bin(
+        &home,
+        root.path(),
+        &quadlet_bin,
+        &["check", quadlet_arg, "--stacks-root", stacks_arg],
+    );
+
+    assert!(
+        output.status.success(),
+        "check <QUADLET> must succeed with the stub generator: {output:?}"
+    );
+    let logged =
+        fs::read_to_string(&log).expect("the stub generator must have logged its invocation");
+    assert!(
+        logged.contains("-dryrun") && logged.contains("-user"),
+        "the generator must be invoked with `-dryrun -user`: {logged}"
+    );
+    assert!(
+        logged.contains("alpha.container"),
+        "the generator must be invoked with the quadlet path: {logged}"
+    );
+}
+
+/// The distro candidate paths `qctl` probes when `QCTL_QUADLET_BIN` is unset,
+/// in probe order. Kept in sync with `QUADLET_BIN_CANDIDATES` in `src/main.rs`.
+const DISTRO_QUADLET_CANDIDATES: [&str; 2] =
+    ["/usr/libexec/podman/quadlet", "/usr/lib/podman/quadlet"];
+
+#[test]
+fn check_without_override_reports_the_probed_candidate_paths() {
+    // Exercises the real, un-overridden resolution path end to end (spec
+    // scenario "check fails with a clear error when no generator is found").
+    // Host-dependent: when a real generator is installed there is nothing to
+    // assert here (the command legitimately resolves it), so the test no-ops.
+    if DISTRO_QUADLET_CANDIDATES
+        .iter()
+        .any(|candidate| Path::new(candidate).exists())
+    {
+        return;
+    }
+
+    let root = TestDir::new("check-no-generator");
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).expect("failed to create home");
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "alpha",
+            &[("alpha.container", "[Container]\nImage=example\n")],
+        )],
+    );
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+    let quadlet = stacks.join("alpha").join("alpha.container");
+    let quadlet_arg = quadlet.to_str().expect("quadlet path must be utf8");
+
+    // No `QCTL_QUADLET_BIN`: `qctl` must fall back to the distro candidates and,
+    // finding none, fail listing every path it probed.
+    let output = run_qctl(
+        &home,
+        root.path(),
+        &["check", quadlet_arg, "--stacks-root", stacks_arg],
+    );
+
+    assert!(
+        !output.status.success(),
+        "check must fail when no generator is found: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for candidate in DISTRO_QUADLET_CANDIDATES {
+        assert!(
+            stderr.contains(candidate),
+            "the error must list the probed candidate {candidate}: {stderr}"
+        );
+    }
+    assert!(
+        stderr.contains("QCTL_QUADLET_BIN"),
+        "the error must mention the QCTL_QUADLET_BIN override: {stderr}"
     );
 }
 
