@@ -342,7 +342,8 @@ Decisions and compatibility:
   flag only sets the argument-less scope.
 - Quadlets whose source disappeared are out of scope for `--project` (they are not
   collected from the project source dirs); address them by name or with the wide view.
-- `uninstall` derives the unit name with an explicit mapping (`generated_unit`) that
-  never relies on `systemd_unit`'s "already has a dot" heuristic, so a dotted stem
+- `uninstall` derives the unit name with an explicit mapping (`generated_unit`), the
+  counterpart of `container_unit` (which always appends `.service` to a stem); neither
+  relies on the removed "already has a dot" heuristic, so a dotted stem
   (`voicebox.prod.container`) still stops `voicebox.prod.service`. Raw unit quadlets
   (`.service`, `.socket`, `.mount`) keep their own unit name.

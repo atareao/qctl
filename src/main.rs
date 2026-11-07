@@ -17,11 +17,18 @@ use tracing_subscriber::EnvFilter;
 
 const QUADLET_EXTENSIONS: &[&str] = &[
     "container",
-    "network",
     "volume",
+    "network",
+    "pod",
+    "kube",
+    "image",
+    "build",
+    "artifact",
     "service",
     "socket",
     "mount",
+    "timer",
+    "path",
 ];
 
 #[derive(Debug, Parser)]
@@ -432,7 +439,7 @@ async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
     let mut handles = Vec::new();
     for unit in targets {
         if ctx.dry_run {
-            println!("DRY-RUN systemctl --user start {}", systemd_unit(&unit));
+            println!("DRY-RUN systemctl --user start {}", container_unit(&unit));
             continue;
         }
 
@@ -442,7 +449,7 @@ async fn start(ctx: &AppContext, service: Option<String>) -> Result<()> {
         }
 
         println!("Starting {unit}");
-        let unit_for_task = unit.clone();
+        let unit_for_task = container_unit(&unit);
         let timeout = ctx.timeout;
         handles.push((
             unit,
@@ -560,7 +567,7 @@ async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
     let mut handles = Vec::new();
     for unit in targets {
         if ctx.dry_run {
-            println!("DRY-RUN systemctl --user stop {}", systemd_unit(&unit));
+            println!("DRY-RUN systemctl --user stop {}", container_unit(&unit));
             continue;
         }
 
@@ -570,7 +577,7 @@ async fn stop(ctx: &AppContext, service: Option<String>) -> Result<()> {
             continue;
         }
 
-        let unit_for_task = unit.clone();
+        let unit_for_task = container_unit(&unit);
         let timeout = ctx.timeout;
         handles.push((
             unit,
@@ -591,7 +598,7 @@ async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
     let mut handles = Vec::new();
     for unit in targets {
         if ctx.dry_run {
-            println!("DRY-RUN systemctl --user restart {}", systemd_unit(&unit));
+            println!("DRY-RUN systemctl --user restart {}", container_unit(&unit));
             continue;
         }
 
@@ -601,7 +608,7 @@ async fn restart(ctx: &AppContext, service: Option<String>) -> Result<()> {
             continue;
         }
 
-        let unit_for_task = unit.clone();
+        let unit_for_task = container_unit(&unit);
         let timeout = ctx.timeout;
         handles.push((
             unit,
@@ -661,7 +668,7 @@ async fn update(ctx: &AppContext, service: Option<String>) -> Result<()> {
         let unit = strip_dot_extension(&basename(path)?);
 
         if let Some(ref svc) = service {
-            if unit != strip_dot_extension(svc) {
+            if unit != strip_quadlet_extension(svc) {
                 continue;
             }
         }
@@ -770,7 +777,7 @@ async fn status(
     for (index, unit) in targets.iter().enumerate() {
         let linked = path_exists(&ctx.target_dir.join(format!("{unit}.container"))).await?;
         let running = if linked {
-            match is_active(unit, ctx.timeout).await {
+            match is_active(&container_unit(unit), ctx.timeout).await {
                 Ok(running) => running,
                 Err(err) => {
                     tracing::warn!("could not query state of {unit}: {err:#}");
@@ -949,7 +956,7 @@ async fn service_rows(ctx: &AppContext, service: Option<String>) -> Result<Vec<S
     for unit in targets {
         let linked = path_exists(&ctx.target_dir.join(format!("{unit}.container"))).await?;
         let running = if linked {
-            match is_active(&unit, ctx.timeout).await {
+            match is_active(&container_unit(&unit), ctx.timeout).await {
                 Ok(running) => running,
                 Err(err) => {
                     tracing::warn!("could not query state of {unit}: {err:#}");
@@ -1423,7 +1430,7 @@ async fn ensure_no_global_collision(ctx: &AppContext) -> Result<()> {
 }
 
 async fn logs(service: String, extra: bool) -> Result<()> {
-    let unit = systemd_unit(&service);
+    let unit = container_unit(&strip_quadlet_extension(&service));
     // `--no-pager` goes last on purpose: a followed stream must not hand the
     // terminal over to a pager that would keep `qctl` alive after journalctl
     // writes nothing more to follow.
@@ -1449,7 +1456,7 @@ async fn logs(service: String, extra: bool) -> Result<()> {
 }
 
 async fn recent_logs(service: &str, timeout: Option<Duration>) -> Result<()> {
-    let unit = systemd_unit(service);
+    let unit = container_unit(&strip_quadlet_extension(service));
     run_command(
         "journalctl",
         &[
@@ -1497,7 +1504,7 @@ async fn unit_is_known(ctx: &AppContext, unit: &str) -> Result<bool> {
 /// invoking `systemctl`/`podman`. Read-only commands never call this.
 async fn ensure_service_known(ctx: &AppContext, service: &Option<String>) -> Result<()> {
     if let Some(svc) = service {
-        let unit = strip_dot_extension(svc);
+        let unit = strip_quadlet_extension(svc);
         if !unit_is_known(ctx, &unit).await? {
             bail!("no such quadlet: {unit}");
         }
@@ -1520,7 +1527,7 @@ async fn resolve_targets(
     scope: TargetScope,
 ) -> Result<Vec<String>> {
     if let Some(svc) = service {
-        return Ok(vec![strip_dot_extension(&svc)]);
+        return Ok(vec![strip_quadlet_extension(&svc)]);
     }
 
     let mut out = Vec::new();
@@ -1671,11 +1678,48 @@ fn extension_of_path(path: &Path) -> Option<&str> {
     path.extension().and_then(|e| e.to_str())
 }
 
+/// Strips the final dotted extension from a file name, blindly.
+///
+/// This is correct only for *real file names* whose extension is known to be a
+/// quadlet extension (for example a basename ending in `.container`). For a
+/// raw user argument use [`strip_quadlet_extension`], which leaves a dotted stem
+/// such as `voicebox.prod` intact.
 fn strip_dot_extension(name: &str) -> String {
     name.rsplit_once('.')
         .map(|(stem, _)| stem)
         .unwrap_or(name)
         .to_string()
+}
+
+/// Strips the final extension only when it is a known quadlet extension.
+///
+/// A *user-supplied* service argument is not guaranteed to be a file name: a
+/// stem may itself contain dots (`voicebox.prod`) and must survive intact. The
+/// blind [`strip_dot_extension`] would turn it into `voicebox`, so callers that
+/// handle raw arguments use this variant instead:
+///
+/// ```text
+/// voicebox.prod            -> voicebox.prod   (".prod" is not a quadlet ext)
+/// voicebox.prod.container  -> voicebox.prod
+/// voicebox                 -> voicebox
+/// ```
+/// Recorta solo extensiones de quadlet conocidas; deja intacto un stem punteado
+/// y no añade sufijos.
+fn strip_quadlet_extension(name: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if QUADLET_EXTENSIONS.contains(&ext) => stem.to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// Forms the systemd user unit for a container quadlet stem.
+///
+/// Unlike the removed dot heuristic, this always appends `.service`, so a stem
+/// that contains dots still resolves correctly (`voicebox.prod` ->
+/// `"voicebox.prod.service"`). Callers must pass a stem, never a formed unit.
+/// Recibe un stem ya resuelto y devuelve la unidad YA formada; no recorta sufijos.
+fn container_unit(stem: &str) -> String {
+    format!("{stem}.service")
 }
 
 /// Returns the trimmed, non-empty value of the first `key=` line in a quadlet,
@@ -1719,12 +1763,12 @@ async fn daemon_reload(ctx: &AppContext) -> Result<()> {
 
 /// Reports whether the systemd user unit is active.
 ///
+/// Recibe la unidad YA formada (p. ej. `voicebox.prod.service`); no aplica sufijos.
 /// Like every other bounded external call this spawns with `kill_on_drop` and
 /// honours the shared deadline, so a wedged `systemctl` cannot hang the status
 /// table forever.
 async fn is_active(unit: &str, timeout: Option<Duration>) -> Result<bool> {
-    let unit = systemd_unit(unit);
-    let args = ["--user", "is-active", unit.as_str()];
+    let args = ["--user", "is-active", unit];
 
     let mut command = Command::new("systemctl");
     command.args(args).kill_on_drop(true);
@@ -1733,26 +1777,18 @@ async fn is_active(unit: &str, timeout: Option<Duration>) -> Result<bool> {
     Ok(String::from_utf8_lossy(&output.stdout).trim() == "active")
 }
 
+/// Recibe la unidad YA formada (p. ej. `voicebox.prod.service`); no aplica sufijos.
 async fn systemctl_user(action: &str, unit: &str, timeout: Option<Duration>) -> Result<()> {
-    let unit = systemd_unit(unit);
-    run_command("systemctl", &["--user", action, &unit], false, timeout).await
-}
-
-fn systemd_unit(unit: &str) -> String {
-    if unit.contains('.') {
-        unit.to_string()
-    } else {
-        format!("{unit}.service")
-    }
+    run_command("systemctl", &["--user", action, unit], false, timeout).await
 }
 
 /// Maps a quadlet file's stem (its name without the extension) and its
 /// extension to the systemd user unit the quadlet generator derives from it.
-/// The mapping is explicit and never relies on `systemd_unit`'s "already has a
-/// dot" heuristic, so a stem that itself contains dots (`voicebox.prod`) still
-/// gets the right suffix: `.container` becomes `<stem>.service`, the
-/// generator-suffixed types become `<stem>-<ext>.service`, and raw unit
-/// quadlets (`.service`, `.socket`, `.mount`) keep their own name.
+/// The mapping is explicit and never relies on a "already has a dot" heuristic,
+/// so a stem that itself contains dots (`voicebox.prod`) still gets the right
+/// suffix: `.container` becomes `<stem>.service`, the generator-suffixed types
+/// become `<stem>-<ext>.service`, and raw unit quadlets (`.service`, `.socket`,
+/// `.mount`) keep their own name.
 fn generated_unit(stem: &str, ext: &str) -> String {
     match ext {
         "container" => format!("{stem}.service"),
@@ -1903,10 +1939,21 @@ mod tests {
     }
 
     #[test]
-    fn systemd_unit_adds_service_suffix_only_for_plain_names() {
-        assert_eq!(systemd_unit("voicebox"), "voicebox.service");
-        assert_eq!(systemd_unit("voicebox.service"), "voicebox.service");
-        assert_eq!(systemd_unit("voicebox.container"), "voicebox.container");
+    fn container_unit_always_appends_service_suffix() {
+        assert_eq!(container_unit("voicebox"), "voicebox.service");
+        assert_eq!(container_unit("voicebox.prod"), "voicebox.prod.service");
+        assert_eq!(container_unit("a.b.c"), "a.b.c.service");
+    }
+
+    #[test]
+    fn strip_quadlet_extension_only_strips_known_extensions() {
+        assert_eq!(strip_quadlet_extension("voicebox.prod"), "voicebox.prod");
+        assert_eq!(
+            strip_quadlet_extension("voicebox.prod.container"),
+            "voicebox.prod"
+        );
+        assert_eq!(strip_quadlet_extension("voicebox"), "voicebox");
+        assert_eq!(strip_quadlet_extension("stack.volume"), "stack");
     }
 
     #[test]
