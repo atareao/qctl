@@ -15,7 +15,7 @@ CLI en Rust para gestionar quadlets de forma simple y segura: instalación de en
 - `qctl start <servicio>` instala **solo** esa unidad si faltaba y la arranca; `qctl start` sin argumentos instala los quadlets que falten y arranca todos.
 - Muestra estado en formato visual (tabla) o compacto (ideal para scripts).
 - Limpia volúmenes de Podman declarados en archivos `.volume`.
-- Ejecuta verificación de quadlets con `/usr/lib/podman/quadlet`.
+- Ejecuta verificación de quadlets con `/usr/lib/podman/quadlet` y, sin argumento, audita todo el stacks root (colisiones duras y avisos de convención de nombres).
 - Sigue logs por servicio con `journalctl`.
 
 ## Requisitos
@@ -25,7 +25,7 @@ CLI en Rust para gestionar quadlets de forma simple y segura: instalación de en
 - `systemctl --user`
 - `podman`
 - `journalctl`
-- `/usr/lib/podman/quadlet`
+- `/usr/lib/podman/quadlet` (la ruta del binario del generador se puede sobreescribir con la variable de entorno `QCTL_QUADLET_BIN`; por defecto es `/usr/lib/podman/quadlet`)
 
 ## Instalación y compilación
 
@@ -100,7 +100,7 @@ qctl update [SERVICE]
 qctl status [SERVICE] [--compact] [--project]
 qctl menu [SERVICE]
 qctl clean-volumes [--yes]
-qctl check <QUADLET>
+qctl check [QUADLET]
 qctl logs <SERVICE>
 qctl logsf <SERVICE>
 qctl completions <SHELL>
@@ -124,6 +124,8 @@ Dos invocaciones quedan **fuera** del plazo, a propósito:
 - `logs` y `logsf`: ejecutan `journalctl` en modo *follow* (`-f`) y deben correr hasta que los interrumpas.
 
 `logs` y `logsf` invocan además `journalctl` con `--no-pager`, para que un paginador configurado en tu sistema no se apodere del terminal de un comando pensado para ser scriptable.
+
+`--stacks-root <DIR>` (global) indica el directorio que contiene **un subdirectorio por stack**. Por defecto es `$HOME/.config/containers/available`. Lo usan la auditoría de `check` sin argumento y la guarda de colisión global de `install`; ver [Auditoría del stacks root](#auditoría-del-stacks-root).
 
 ### Nombres de servicio y seguridad del directorio destino
 
@@ -175,6 +177,30 @@ ServiceName=api-db
 Con eso el runtime genera `api-web.service` y `api-db.service`, sin colisión. `ServiceName=` está disponible en las secciones `[Container]`, `[Pod]`, `[Network]`, `[Volume]`, `[Build]`, `[Image]` y `[Artifact]`; el nombre no debe incluir la extensión `.service`. No confundir con `ContainerName=`, que cambia el nombre del contenedor de Podman (por defecto `systemd-%N`) y **no** el de la unidad systemd.
 
 **Limitación conocida:** `qctl` resuelve nombre → fichero por basename (`<origen>/<nombre>.container` o `<destino>/<nombre>.container`). Un quadlet con `ServiceName=api-web` sigue llamándose `api.container`, así que `qctl install` lo enlaza y el runtime genera `api-web.service`, pero `qctl start api-web` falla con `no such quadlet: api-web`. Direccionar unidades renombradas exige un cambio de código y queda fuera del alcance de esta versión.
+
+### Auditoría del stacks root
+
+Las colisiones de basename descritas arriba se detectan **dentro del primer nivel** del proyecto actual. Pero un mismo `$HOME/.config/containers/systemd` es un directorio plano compartido por todos los stacks enlazados: dos stacks distintos pueden declarar el mismo basename de unidad (o el mismo `ContainerName=`) sin que ninguno lo note por separado. Para cubrir ese caso existen dos mecanismos que trabajan sobre el **stacks root** (`--stacks-root`, por defecto `$HOME/.config/containers/available`):
+
+- **`check` sin argumento** — audita cada stack del stacks root (una pasada por stack, incluyendo su subdirectorio `quadlets/` si existe) y clasifica los problemas en dos grupos:
+  - **Colisiones duras** (dos o más stacks declaran el mismo basename de unidad, o el mismo `ContainerName=`): se reportan por stderr y el comando termina con **código de salida distinto de cero**. Son un fallo real que rompería el `HOME`.
+  - **Avisos de convención** (un basename que no sigue `<stack>.<ext>` ni `<stack>-<rol>`): se reportan por stderr pero **no** hacen fallar el comando. Son solo un recordatorio de estilo.
+- **`check <QUADLET>`** — conserva el comportamiento previo: valida **un único** fichero con `/usr/lib/podman/quadlet`.
+
+```bash
+# Auditoría global del stacks root por defecto
+qctl check
+
+# Auditoría de un stacks root alternativo
+qctl check --stacks-root /ruta/a/available
+
+# Validación de un fichero suelto (comportamiento previo)
+qctl check quadlets/voicebox.container
+```
+
+### Guarda de colisión global en `install`
+
+`install` ejecuta la misma auditoría **antes de tocar el sistema de ficheros** y, si el stack desde el que se lanza aparece en alguna colisión dura, **aborta el `install` completo** con código de salida distinto de cero. El stack se identifica desde el directorio de trabajo cuando este es un hijo directo del stacks root **o** su subdirectorio `quadlets/` (es decir, tanto `available/<stack>` como `available/<stack>/quadlets`). La comprobación es atómica: se decide antes de crear el primer symlink, así que un aborto deja `$HOME/.config/containers/systemd` intacto. Si el directorio de trabajo no encaja en ninguno de esos dos casos, la guarda no aplica (no hay stack que atribuir).
 
 ## Ejemplos
 

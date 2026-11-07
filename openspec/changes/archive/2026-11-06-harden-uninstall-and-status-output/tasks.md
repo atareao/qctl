@@ -36,7 +36,7 @@
 - [x] 4.2 `cargo test` completo en verde.
 - [x] 4.3 Auditoría con `@rust-reviewer`: cerrar bloqueantes, mayores y menores hasta LISTO PARA MERGE.
 - [x] 4.4 PR contra `develop`, CI verde, merge y `openspec archive harden-uninstall-and-status-output`.
-- [ ] 4.5 Añadir los eventos a `CHANGELOG.md`/release según `CONTRIBUTING.md` y comprobar que no quedan PRs abiertos ni tareas sin marcar.
+- [x] 4.5 Añadir los eventos a `CHANGELOG.md`/release según `CONTRIBUTING.md` y comprobar que no quedan PRs abiertos ni tareas sin marcar.
 
 ## 5. Ronda de correcciones post-auditoría (A–D)
 
