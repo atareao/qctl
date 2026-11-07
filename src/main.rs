@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
-use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Cell, Color, Table};
+use comfy_table::{presets::UTF8_FULL, Cell, Color, Table};
 use tokio::fs;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
@@ -758,8 +758,7 @@ async fn status(
     let mut table = Table::new();
     if !compact {
         table
-            .load_preset(UTF8_FULL)
-            .apply_modifier(UTF8_ROUND_CORNERS)
+            .load_style(UTF8_FULL.with_rounded_corners())
             .set_header(vec!["#", "Link", "State", "Unit"]);
     }
 
@@ -974,8 +973,7 @@ async fn service_rows(ctx: &AppContext, service: Option<String>) -> Result<Vec<S
 fn print_menu_table(rows: &[ServiceRow]) {
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(vec!["#", "Link", "State", "Action", "Unit"]);
 
     for (index, row) in rows.iter().enumerate() {
