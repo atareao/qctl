@@ -10,7 +10,8 @@ Reviewed surfaces:
 
 - Symlink creation and removal in `$HOME/.config/containers/systemd`
 - Podman volume removal through `clean-volumes`
-- `systemctl --user`, `journalctl`, and `/usr/lib/podman/quadlet` command execution
+- `systemctl --user`, `journalctl`, and the autodetected Podman quadlet generator
+  (`/usr/libexec/podman/quadlet` or `/usr/lib/podman/quadlet`, overridable with `QCTL_QUADLET_BIN`) command execution
 - CLI argument behavior and service name normalization
 - Quadlet discovery and duplicate handling
 - CI and release workflows
@@ -60,7 +61,9 @@ Note: `cargo build --verbose` may print a Cargo cache warning in this sandbox be
 
 - `menu` remains interactive; only its EOF/termination behavior is covered by an automated integration test.
 - `logs` and `logsf` stream `journalctl`; tests assert their argument sets but do not exercise long-running follow mode.
-- `check` depends on `/usr/lib/podman/quadlet`; it is not integration-tested because the binary path is host-specific.
+- `check` resolves the Podman quadlet generator from the distro candidates
+  (`/usr/libexec/podman/quadlet`, `/usr/lib/podman/quadlet`) or `QCTL_QUADLET_BIN`; integration
+  tests inject a stub via the override, and the no-override failure path is host-dependent.
 - `clean-volumes --yes` is intentionally destructive. The confirmation and `--dry-run` guard reduce accidental use, but scripts must still use it carefully.
 - A bounded external command that times out is killed as a direct child only;
   any process it forked survives and is not reaped. `systemctl --user` does not
