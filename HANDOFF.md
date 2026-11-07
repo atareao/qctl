@@ -15,20 +15,28 @@
   - **errserve**: healthy.
   - Verificado: `qctl check` 0.6.2 exit 0 (2 WARN no bloqueantes de naming); `https://auth.servidorlinux.es/` → 200; los 3 contenedores healthy vía systemd user.
   - yadm operativo (`core.worktree` corregido a `/home/runner`); subuid/subgid/DB/secrets sin rutas viejas.
-- **Releases 0.6.0/0.6.1**: publicados antes; `main` == `develop` en v0.6.2.
+
+## Wrapper `rr` (acceso a producción)
+
+Para operar el stack en `new_atareao` se usa el wrapper **`rr`** (dos copias cooperantes):
+
+- **Remoto** `~/bin/rr` en `lorenzo` (servidor): `sudo -n -u runner -H env XDG_RUNTIME_DIR=/run/user/1002 PATH=/usr/local/bin:/usr/bin:/home/runner/.local/bin SOPS_AGE_KEY_FILE=/home/runner/.secrets/sops/age/key.txt bash -lc "cd && <cmd>"`. Aporta el entorno completo (systemd user bus + crypta/sops + `~/.local/bin`) y fuerza bash (el login shell de `runner` es fish).
+- **Local** `~/bin/rr` en la máquina que inicia la sesión: envía el comando al remoto por **base64** (protege del quoting de fish, local y remoto) y lo ejecuta a través del `rr` remoto.
+
+Uso:
+
+```bash
+rr                          # shell interactivo de runner (pide TTY)
+rr "podman ps"              # comando como runner, sin TTY
+rr "crypta lookup oidc_client_id"   # secretos SOPS+age
+```
+
+Reglas: nunca SSH directo como `runner`; siempre `lorenzo` → `rr`. `runner` no tiene sudo; `lorenzo` (grupo sudo) es el humano que eleva. Implementado y documentado (README.md, AGENTS.md, setup_apps.sh) en el repo `self-hosted-podman`.
 
 ## Tarea pendiente
 
 - **Ninguna en `qctl`.** Cero issues abiertas; `develop` == `main` en v0.6.2.
-- **Handoff cruzado → `self-hosted-podman` (siguiente sesión):**
-  - Reconciliar el repo yadm del host `new_atareao` (en `ca217bb`) con `origin/main` (en GitHub en
-    `9c34c83` + últimos commits de docs/PLAN-008): el repo yadm tiene commits de docs(gestion-stacks)/
-    PLAN-003 sin empujar (divergencia pre-existente). Hacer `yadm pull` y resolver SI hay conflicto;
-    NO force-push.
-  - Recordar: los helpers fish `{qenable,qdisable,qlist,qcheck}.fish` ya fueron retirados en el commit
-    `f59e0d4` del repo yadm (local, sin empujar) — verificar coherencia con la rama `main` de GitHub.
-  - Revisar `docs/rename-usuario-produccion.md` (nueva doc del PLAN-008) y `AGENTS.md` del repo por
-    referencias al usuario `podman`/ruta `/home/podman` caducadas.
+- **Handoff cruzado `self-hosted-podman`: PLAN-008 CERRADO y docs publicadas.** Queda solo el WARN no bloqueante de naming (`proxy.network` en stack traefik y `security.network` en vector) del `qctl check`, para una sesión futura de limpieza — no es un bloqueo.
 
 ## Verificación
 `cargo test` (16 unit + 86 integración) · fmt/clippy/validate verdes · release workflow verde.
@@ -37,6 +45,6 @@
 - Gitflow: PR a `develop`; PR a `main` solo desde `release/*`/`hotfix/*` (branch-guard). Commits gitmoji. `Cargo.lock` ignorado.
 - **`.vampus.yml` fuente de verdad de versión** (editar ahí + propagar Cargo.toml); `git flow release start/publish/finish`.
 - Escritor fiable: **`backend-dev`** (el `plan-writer` no dispone de `write`). NO pasar el parámetro `model` a los subagentes.
-- **`host new_atareao` = Ubuntu 26.04 (vmi3651091)**: producción bajo el usuario **`runner`** (uid 1002, antes `podman`), shell fish, yadm + stacks root (`~/.config/containers/available`, 124 funciones) + `systemd` user en `/home/runner`. qctl en `~runner/.local/bin/qctl` (0.6.2).
-- Para la sesión remota como runner: `sudo -n -u runner -H bash -lc "..."` exportando `XDG_RUNTIME_DIR=/run/user/1002`, `SOPS_AGE_KEY_FILE=~/.secrets/sops/age/key.txt` y `PATH=/usr/local/bin:/usr/bin:$HOME/.local/bin`.
+- **`host new_atareao` = Ubuntu 26.04 (vmi3651091)**: producción bajo el usuario **`runner`** (uid 1002, antes `podman`), shell fish, yadm + stacks root (`~/.config/containers/available`, **128** stacks) + `systemd` user en `/home/runner`. qctl en `~runner/.local/bin/qctl` (0.6.2).
+- Comando de acceso rápido: **`rr "<cmd>"`** (wrapper, ver arriba) — `XDG_RUNTIME_DIR=/run/user/1002`, `SOPS_AGE_KEY_FILE=~/.secrets/sops/age/key.txt`, `PATH` con `~/.local/bin` ya exportados.
 - Para instalar ficheros como runner en /tmp ajeno: usar `install -m 0755` (cp), nunca `mv` (sticky bit).
