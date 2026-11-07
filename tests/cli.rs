@@ -2823,3 +2823,344 @@ fn install_guard_does_not_apply_outside_stacks_root() {
         "install must reload systemd as before"
     );
 }
+
+// ---------------------------------------------------------------------------
+// fix-systemd-unit-dots: a container stem that itself contains dots
+// (`voicebox.prod`) must still resolve to `<stem>.service` everywhere —
+// start/stop/restart (and their --dry-run), logs and the is-active query that
+// status/menu issue. The old `systemd_unit` heuristic treated any dotted name as
+// already formed and dropped the `.service` suffix.
+// (openspec/changes/fix-systemd-unit-dots).
+// ---------------------------------------------------------------------------
+
+/// A fake `systemctl` that logs every invocation and reports `active` on
+/// `is-active` only when the queried argument is exactly `active_unit` (never
+/// the bare stem), so a status test can prove the formed unit is what gets
+/// queried.
+fn fake_unit_active_systemctl(bin: &Path, log: &Path, active_unit: &str) {
+    let script = format!(
+        r#"#!/bin/sh
+echo "$@" >> {log}
+if [ "$2" = "is-active" ] && [ "$3" = "{unit}" ]; then
+  echo active
+fi
+exit 0
+"#,
+        log = log.display(),
+        unit = active_unit
+    );
+    let systemctl = bin.join("systemctl");
+    write_file(&systemctl, &script);
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755))
+        .expect("failed to chmod fake systemctl");
+}
+
+/// A project owning one container quadlet whose stem may contain dots, linked
+/// into the shared target dir, with fake `systemctl`/`journalctl` in a private
+/// `bin`. Centralises the mount so the dotted-stem tests stay focused on the
+/// formed unit rather than on wiring the layout.
+struct DottedStemLayout {
+    home: PathBuf,
+    project: PathBuf,
+    bin: PathBuf,
+    systemctl_log: PathBuf,
+    journalctl_log: PathBuf,
+}
+
+impl DottedStemLayout {
+    fn new(root: &Path, stem: &str) -> Self {
+        let home = root.join("home");
+        let project = root.join("project");
+        let bin = root.join("bin");
+        let systemctl_log = root.join("systemctl.log");
+        let journalctl_log = root.join("journalctl.log");
+        let target = home.join(".config").join("containers").join("systemd");
+
+        fs::create_dir_all(&target).expect("failed to create target dir");
+        fs::create_dir_all(&project).expect("failed to create project");
+        fs::create_dir_all(&bin).expect("failed to create bin");
+        fake_systemctl(&bin, &systemctl_log);
+        fake_journalctl(&bin, &journalctl_log);
+
+        let source = project.join(format!("{stem}.container"));
+        write_file(&source, "[Container]\nImage=example\n");
+        symlink(&source, target.join(format!("{stem}.container")))
+            .expect("failed to create test symlink");
+
+        Self {
+            home,
+            project,
+            bin,
+            systemctl_log,
+            journalctl_log,
+        }
+    }
+
+    fn path(&self) -> String {
+        prepend_path(&self.bin)
+    }
+}
+
+#[test]
+fn start_forms_unit_for_plain_stem() {
+    let root = TestDir::new("start-plain-stem");
+    let layout = DottedStemLayout::new(root.path(), "voicebox");
+
+    let path = layout.path();
+    let output = run_qctl_with_path(
+        &layout.home,
+        &layout.project,
+        Path::new(&path),
+        &["start", "voicebox"],
+    );
+    assert!(output.status.success(), "start voicebox failed: {output:?}");
+
+    let logged = fs::read_to_string(&layout.systemctl_log).expect("missing systemctl log");
+    assert!(
+        logged
+            .lines()
+            .any(|line| line == "--user start voicebox.service"),
+        "start must form the plain stem as voicebox.service: {logged}"
+    );
+}
+
+#[test]
+fn start_forms_unit_for_dotted_stem() {
+    let root = TestDir::new("start-dotted-stem");
+    let layout = DottedStemLayout::new(root.path(), "voicebox.prod");
+
+    let path = layout.path();
+    let output = run_qctl_with_path(
+        &layout.home,
+        &layout.project,
+        Path::new(&path),
+        &["start", "voicebox.prod"],
+    );
+    assert!(
+        output.status.success(),
+        "start voicebox.prod failed: {output:?}"
+    );
+
+    let logged = fs::read_to_string(&layout.systemctl_log).expect("missing systemctl log");
+    assert!(
+        logged
+            .lines()
+            .any(|line| line == "--user start voicebox.prod.service"),
+        "start must append .service to a dotted stem: {logged}"
+    );
+    assert!(
+        !logged
+            .lines()
+            .any(|line| line == "--user start voicebox.prod"),
+        "start must never pass the bare dotted stem as the unit argument: {logged}"
+    );
+}
+
+#[test]
+fn stop_forms_unit_for_dotted_stem() {
+    let root = TestDir::new("stop-dotted-stem");
+    let layout = DottedStemLayout::new(root.path(), "voicebox.prod");
+
+    let path = layout.path();
+    let output = run_qctl_with_path(
+        &layout.home,
+        &layout.project,
+        Path::new(&path),
+        &["stop", "voicebox.prod"],
+    );
+    assert!(
+        output.status.success(),
+        "stop voicebox.prod failed: {output:?}"
+    );
+
+    let logged = fs::read_to_string(&layout.systemctl_log).expect("missing systemctl log");
+    assert!(
+        logged
+            .lines()
+            .any(|line| line == "--user stop voicebox.prod.service"),
+        "stop must append .service to a dotted stem: {logged}"
+    );
+}
+
+#[test]
+fn restart_forms_unit_for_dotted_stem() {
+    let root = TestDir::new("restart-dotted-stem");
+    let layout = DottedStemLayout::new(root.path(), "voicebox.prod");
+
+    let path = layout.path();
+    let output = run_qctl_with_path(
+        &layout.home,
+        &layout.project,
+        Path::new(&path),
+        &["restart", "voicebox.prod"],
+    );
+    assert!(
+        output.status.success(),
+        "restart voicebox.prod failed: {output:?}"
+    );
+
+    let logged = fs::read_to_string(&layout.systemctl_log).expect("missing systemctl log");
+    assert!(
+        logged
+            .lines()
+            .any(|line| line == "--user restart voicebox.prod.service"),
+        "restart must append .service to a dotted stem: {logged}"
+    );
+}
+
+#[test]
+fn dry_run_prints_formed_unit_for_dotted_stem() {
+    let root = TestDir::new("dry-run-dotted-stem");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&home).expect("failed to create home");
+    write_file(
+        &project.join("voicebox.prod.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let output = run_qctl(&home, &project, &["--dry-run", "start", "voicebox.prod"]);
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("DRY-RUN systemctl --user start voicebox.prod.service"),
+        "dry-run must print the formed unit, not the bare stem: {stdout}"
+    );
+}
+
+#[test]
+fn logs_forms_unit_for_dotted_stem() {
+    let root = TestDir::new("logs-dotted-stem");
+    let layout = DottedStemLayout::new(root.path(), "voicebox.prod");
+
+    let path = layout.path();
+    let output = run_qctl_with_path(
+        &layout.home,
+        &layout.project,
+        Path::new(&path),
+        &["logs", "voicebox.prod"],
+    );
+    assert!(
+        output.status.success(),
+        "logs voicebox.prod failed: {output:?}"
+    );
+
+    let logged = fs::read_to_string(&layout.journalctl_log).expect("missing journalctl log");
+    let args: Vec<&str> = logged.split_whitespace().collect();
+    assert!(
+        args.contains(&"voicebox.prod.service"),
+        "logs must query -u voicebox.prod.service: {logged}"
+    );
+    assert!(
+        !args.contains(&"voicebox.prod"),
+        "logs must never pass the bare dotted stem to journalctl: {logged}"
+    );
+}
+
+#[test]
+fn status_reports_dotted_stem_as_running() {
+    let root = TestDir::new("status-dotted-running");
+    let layout = DottedStemLayout::new(root.path(), "voicebox.prod");
+    fake_unit_active_systemctl(&layout.bin, &layout.systemctl_log, "voicebox.prod.service");
+
+    let path = layout.path();
+    let output = run_qctl_with_path(&layout.home, &layout.project, Path::new(&path), &["status"]);
+    assert!(output.status.success(), "status failed: {output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("voicebox.prod"),
+        "status must list the dotted stem: {stdout}"
+    );
+    assert!(
+        stdout.contains("running = 1"),
+        "status must count the formed unit as running: {stdout}"
+    );
+    assert!(
+        stdout.contains("🟢"),
+        "status must render the running indicator for the dotted stem: {stdout}"
+    );
+}
+
+#[test]
+fn status_never_queries_bare_dotted_stem() {
+    let root = TestDir::new("status-dotted-no-bare");
+    let layout = DottedStemLayout::new(root.path(), "voicebox.prod");
+    fake_unit_active_systemctl(&layout.bin, &layout.systemctl_log, "voicebox.prod.service");
+
+    let path = layout.path();
+    let output = run_qctl_with_path(&layout.home, &layout.project, Path::new(&path), &["status"]);
+    assert!(output.status.success(), "status failed: {output:?}");
+
+    let logged = fs::read_to_string(&layout.systemctl_log).expect("missing systemctl log");
+    let queries: Vec<&str> = logged
+        .lines()
+        .filter(|line| line.contains("is-active"))
+        .collect();
+    assert!(
+        !queries.is_empty(),
+        "status must query the unit state, found no is-active call: {logged}"
+    );
+    for line in &queries {
+        assert!(
+            line.ends_with("voicebox.prod.service"),
+            "status must query the formed unit, never the bare stem: {line}"
+        );
+    }
+    assert!(
+        !logged
+            .lines()
+            .any(|line| line == "--user is-active voicebox.prod"),
+        "status must never invoke is-active with the bare dotted stem: {logged}"
+    );
+}
+
+#[test]
+fn stop_accepts_full_quadlet_filename_for_dotted_stem() {
+    let root = TestDir::new("stop-full-filename-dotted-stem");
+    let layout = DottedStemLayout::new(root.path(), "voicebox.prod");
+
+    let path = layout.path();
+    let output = run_qctl_with_path(
+        &layout.home,
+        &layout.project,
+        Path::new(&path),
+        &["stop", "voicebox.prod.container"],
+    );
+    assert!(
+        output.status.success(),
+        "stop voicebox.prod.container failed: {output:?}"
+    );
+
+    let logged = fs::read_to_string(&layout.systemctl_log).expect("missing systemctl log");
+    assert!(
+        logged
+            .lines()
+            .any(|line| line == "--user stop voicebox.prod.service"),
+        "stop must strip the .container filename and form voicebox.prod.service: {logged}"
+    );
+}
+
+#[test]
+fn restart_dry_run_prints_formed_unit_for_dotted_stem() {
+    let root = TestDir::new("restart-dry-run-dotted-stem");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    fs::create_dir_all(&project).expect("failed to create project");
+    fs::create_dir_all(&home).expect("failed to create home");
+    write_file(
+        &project.join("voicebox.prod.container"),
+        "[Container]\nImage=example\n",
+    );
+
+    let output = run_qctl(&home, &project, &["--dry-run", "restart", "voicebox.prod"]);
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("DRY-RUN systemctl --user restart voicebox.prod.service"),
+        "dry-run must print the formed unit, not the bare stem: {stdout}"
+    );
+}
