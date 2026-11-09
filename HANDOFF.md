@@ -35,7 +35,9 @@ Reglas: nunca SSH directo como `runner`; siempre `lorenzo` → `rr`. `runner` no
 
 ## Tarea pendiente
 
-- **Ninguna en `qctl`.** Cero issues abiertas; `develop` == `main` en v0.6.2.
+- **PR #30 abierto** (`feature/purge-command` → `develop`): nuevo comando `qctl purge` (issue #29). CI en curso. Tras merge: `openspec archive purge-command` y renombrar `plans/PLAN-003.md` → `plans/PLAN-003-ARCHIVED.md`.
+- **Issue #29 abierto** hasta el merge de la PR #30.
+- Resto: `develop` == `main` en v0.6.2.
 - **Handoff cruzado `self-hosted-podman`: PLAN-008 CERRADO y docs publicadas.** Queda solo el WARN no bloqueante de naming (`proxy.network` en stack traefik y `security.network` en vector) del `qctl check`, para una sesión futura de limpieza — no es un bloqueo.
 
 ## Verificación

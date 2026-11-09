@@ -3281,3 +3281,593 @@ fn restart_dry_run_prints_formed_unit_for_dotted_stem() {
         "dry-run must print the formed unit, not the bare stem: {stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// purge-command (openspec/changes/purge-command): `qctl purge` composes
+// `uninstall` + `clean-volumes` and, with explicit opt-in, removes secrets,
+// images and eligible host-side bind data, guarding shared resources.
+// ---------------------------------------------------------------------------
+
+/// Creates `home/` and `bin/` with fake `systemctl` and `podman` shims and
+/// returns `(home, PATH, systemctl_log, podman_log)`.
+fn purge_sandbox(root: &Path) -> (PathBuf, String, PathBuf, PathBuf) {
+    let home = root.join("home");
+    let bin = root.join("bin");
+    let systemctl_log = root.join("systemctl.log");
+    let podman_log = root.join("podman.log");
+    fs::create_dir_all(&home).expect("failed to create home");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &systemctl_log);
+    fake_podman(&bin, &podman_log);
+    (home, prepend_path(&bin), systemctl_log, podman_log)
+}
+
+/// Runs qctl with a custom PATH and piped stdin.
+fn run_qctl_with_stdin_and_path(
+    home: &Path,
+    cwd: &Path,
+    path: &str,
+    args: &[&str],
+    stdin: &str,
+) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_qctl"))
+        .args(args)
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("USER", "qctl-test")
+        .env("PATH", path)
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn qctl");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin not piped")
+        .write_all(stdin.as_bytes())
+        .expect("failed to write stdin");
+
+    child.wait_with_output().expect("failed to wait for qctl")
+}
+
+#[test]
+fn purge_without_flags_uninstalls_and_cleans_volumes_only() {
+    let root = TestDir::new("purge-base");
+    let (home, path, systemctl_log, podman_log) = purge_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "demo",
+            &[
+                (
+                    "demo.container",
+                    "[Container]\nImage=example\nSecret=demo_secret\n",
+                ),
+                ("demo-data.volume", "[Volume]\nVolumeName=demo-data\n"),
+            ],
+        )],
+    );
+    let stack = stacks.join("demo");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    // Install first, so `uninstall` has a symlink to stop and remove.
+    let install = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &["install", "--stacks-root", stacks_arg],
+    );
+    assert!(install.status.success(), "{install:?}");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &["purge", "--yes", "--stacks-root", stacks_arg],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let systemctl = fs::read_to_string(&systemctl_log).expect("missing systemctl log");
+    assert!(
+        systemctl.contains("--user stop demo.service"),
+        "purge must stop the stack's units: {systemctl}"
+    );
+    assert!(
+        systemctl.contains("--user daemon-reload"),
+        "purge must reload the daemon: {systemctl}"
+    );
+
+    let podman = fs::read_to_string(&podman_log).expect("missing podman log");
+    assert!(
+        podman.contains("volume rm -f demo-data"),
+        "purge must remove the declared named volume: {podman}"
+    );
+    assert!(
+        !podman.contains("secret rm") && !podman.contains("rmi"),
+        "purge without flags must touch no secret or image: {podman}"
+    );
+
+    let target = home.join(".config").join("containers").join("systemd");
+    assert!(
+        symlinks_under(&target).is_empty(),
+        "uninstall must remove the stack's symlinks: {:?}",
+        symlinks_under(&target)
+    );
+}
+
+#[test]
+fn purge_secrets_removes_own_and_skips_shared() {
+    let root = TestDir::new("purge-secrets");
+    let (home, path, _systemctl_log, podman_log) = purge_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[
+            (
+                "alpha",
+                &[(
+                    "a.container",
+                    "[Container]\nImage=alpha\nSecret=alpha_only\nSecret=shared_secret\n",
+                )],
+            ),
+            (
+                "bravo",
+                &[(
+                    "b.container",
+                    "[Container]\nImage=bravo\nSecret=shared_secret\n",
+                )],
+            ),
+        ],
+    );
+    let stack = stacks.join("alpha");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &["purge", "--secrets", "--yes", "--stacks-root", stacks_arg],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("skip: secreto 'shared_secret' todavía lo usa la stack 'bravo'"),
+        "purge must skip the shared secret and name the other stack: {stdout}"
+    );
+
+    let podman = fs::read_to_string(&podman_log).expect("missing podman log");
+    assert!(
+        podman.contains("secret rm alpha_only"),
+        "purge must remove the stack's own secret: {podman}"
+    );
+    assert!(
+        !podman.contains("secret rm shared_secret"),
+        "purge must not remove a shared secret: {podman}"
+    );
+}
+
+#[test]
+fn purge_secrets_force_removes_shared() {
+    let root = TestDir::new("purge-secrets-force");
+    let (home, path, _systemctl_log, podman_log) = purge_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[
+            (
+                "alpha",
+                &[("a.container", "[Container]\nSecret=shared_secret\n")],
+            ),
+            (
+                "bravo",
+                &[("b.container", "[Container]\nSecret=shared_secret\n")],
+            ),
+        ],
+    );
+    let stack = stacks.join("alpha");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &[
+            "purge",
+            "--secrets",
+            "--force",
+            "--yes",
+            "--stacks-root",
+            stacks_arg,
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let podman = fs::read_to_string(&podman_log).expect("missing podman log");
+    assert!(
+        podman.contains("secret rm shared_secret"),
+        "--force must remove a shared secret: {podman}"
+    );
+}
+
+#[test]
+fn purge_images_removes_own_and_skips_shared() {
+    let root = TestDir::new("purge-images");
+    let (home, path, _systemctl_log, podman_log) = purge_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[
+            (
+                "alpha",
+                &[("a.container", "[Container]\nImage=example/alpha:1\n")],
+            ),
+            (
+                "bravo",
+                &[("b.container", "[Container]\nImage=example/shared:1\n")],
+            ),
+        ],
+    );
+    let stack = stacks.join("alpha");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &["purge", "--images", "--yes", "--stacks-root", stacks_arg],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let podman = fs::read_to_string(&podman_log).expect("missing podman log");
+    assert!(
+        podman.contains("rmi example/alpha:1"),
+        "purge must remove the stack's own image: {podman}"
+    );
+}
+
+#[test]
+fn purge_images_skip_shared() {
+    let root = TestDir::new("purge-images-skip");
+    let (home, path, _systemctl_log, podman_log) = purge_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[
+            (
+                "alpha",
+                &[("a.container", "[Container]\nImage=example/shared:1\n")],
+            ),
+            (
+                "bravo",
+                &[("b.container", "[Container]\nImage=example/shared:1\n")],
+            ),
+        ],
+    );
+    let stack = stacks.join("alpha");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &["purge", "--images", "--yes", "--stacks-root", stacks_arg],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("skip: imagen 'example/shared:1' todavía la usa la stack 'bravo'"),
+        "purge must skip the shared image and name the other stack: {stdout}"
+    );
+
+    let podman = fs::read_to_string(&podman_log).unwrap_or_default();
+    assert!(
+        !podman.contains("rmi example/shared:1"),
+        "purge must not remove a shared image: {podman}"
+    );
+}
+
+#[test]
+fn purge_images_force_removes_shared() {
+    let root = TestDir::new("purge-images-force");
+    let (home, path, _systemctl_log, podman_log) = purge_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[
+            (
+                "alpha",
+                &[("a.container", "[Container]\nImage=example/shared:1\n")],
+            ),
+            (
+                "bravo",
+                &[("b.container", "[Container]\nImage=example/shared:1\n")],
+            ),
+        ],
+    );
+    let stack = stacks.join("alpha");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &[
+            "purge",
+            "--images",
+            "--force",
+            "--yes",
+            "--stacks-root",
+            stacks_arg,
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let podman = fs::read_to_string(&podman_log).expect("missing podman log");
+    assert!(
+        podman.contains("rmi example/shared:1"),
+        "--force must remove a shared image: {podman}"
+    );
+}
+
+#[test]
+fn purge_secrets_fail_closed_when_stack_unresolved() {
+    let root = TestDir::new("purge-unresolved");
+    let (home, path, _systemctl_log, podman_log) = purge_sandbox(root.path());
+    // The stacks root holds a stack, but the working directory is outside it, so
+    // `current_stack_name` resolves to `None`.
+    let stacks = stacks_root_with(
+        root.path(),
+        &[("alpha", &[("a.container", "[Container]\nSecret=other\n")])],
+    );
+    let elsewhere = root.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("failed to create elsewhere");
+    write_file(
+        &elsewhere.join("solo.container"),
+        "[Container]\nSecret=only\n",
+    );
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &elsewhere,
+        Path::new(&path),
+        &["purge", "--secrets", "--yes", "--stacks-root", stacks_arg],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not resolved"),
+        "an unresolved stack must be warned about: {stderr}"
+    );
+
+    let podman = fs::read_to_string(&podman_log).unwrap_or_default();
+    assert!(
+        !podman.contains("secret rm"),
+        "fail-closed must remove no secret when the stack cannot be resolved: {podman}"
+    );
+}
+
+#[test]
+fn purge_data_removes_home_binds_and_ignores_sockets_and_system_paths() {
+    let root = TestDir::new("purge-data");
+    let (home, path, _systemctl_log, _podman_log) = purge_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "demo",
+            &[(
+                "demo.container",
+                "[Container]\nImage=example\n\
+                 Volume=%h/.config/demo/data:/data:Z\n\
+                 Volume=%t/podman/podman.sock:/var/run/docker.sock:ro\n\
+                 Volume=/etc/not-ours:/etc/not-ours:ro\n",
+            )],
+        )],
+    );
+    let data_dir = home.join(".config").join("demo").join("data");
+    fs::create_dir_all(&data_dir).expect("failed to create bind dir");
+    let stack = stacks.join("demo");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &["purge", "--data", "--yes", "--stacks-root", stacks_arg],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    assert!(
+        !data_dir.exists(),
+        "purge --data must remove the eligible bind under $HOME"
+    );
+}
+
+#[test]
+fn purge_data_uses_podman_unshare_for_mapped_uid() {
+    let root = TestDir::new("purge-data-unshare");
+    let (home, path, _systemctl_log, podman_log) = purge_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "demo",
+            &[(
+                "demo.container",
+                "[Container]\nImage=example\nUser=1000:1000\n\
+                 Volume=%h/.config/demo/data:/data:Z\n",
+            )],
+        )],
+    );
+    let data_dir = home.join(".config").join("demo").join("data");
+    fs::create_dir_all(&data_dir).expect("failed to create bind dir");
+    let stack = stacks.join("demo");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &["purge", "--data", "--yes", "--stacks-root", stacks_arg],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let podman = fs::read_to_string(&podman_log).expect("missing podman log");
+    assert!(
+        podman.contains(&format!("unshare rm -rf {}", data_dir.display())),
+        "a mapped uid must use `podman unshare rm -rf`: {podman}"
+    );
+}
+
+#[test]
+fn purge_dry_run_prints_plan_without_calling_podman() {
+    let root = TestDir::new("purge-dry-run");
+    let (home, path, _systemctl_log, podman_log) = purge_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "demo",
+            &[(
+                "demo.container",
+                "[Container]\nImage=example\nSecret=demo_secret\n",
+            )],
+        )],
+    );
+    let stack = stacks.join("demo");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &[
+            "--dry-run",
+            "purge",
+            "--secrets",
+            "--images",
+            "--data",
+            "--stacks-root",
+            stacks_arg,
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("DRY-RUN podman secret rm demo_secret"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("DRY-RUN podman rmi example"), "{stdout}");
+    assert!(!stdout.contains("Continue?"), "{stdout}");
+
+    let podman_ran = fs::read_to_string(&podman_log)
+        .map(|log| !log.trim().is_empty())
+        .unwrap_or(false);
+    assert!(!podman_ran, "--dry-run must not invoke podman");
+}
+
+#[test]
+fn purge_lists_and_aborts_on_declined_confirmation() {
+    let root = TestDir::new("purge-decline");
+    let (home, path, systemctl_log, podman_log) = purge_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "demo",
+            &[
+                (
+                    "demo.container",
+                    "[Container]\nImage=example\nSecret=demo_secret\n",
+                ),
+                ("demo-data.volume", "[Volume]\nVolumeName=demo-data\n"),
+            ],
+        )],
+    );
+    let stack = stacks.join("demo");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_stdin_and_path(
+        &home,
+        &stack,
+        &path,
+        &["purge", "--secrets", "--stacks-root", stacks_arg],
+        "n\n",
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("demo_secret"),
+        "the secret must be listed before confirming: {stdout}"
+    );
+    assert!(
+        stdout.contains("demo-data"),
+        "the base volumes must be listed too: {stdout}"
+    );
+    assert!(stdout.contains("Continue? [y/N]:"), "{stdout}");
+    assert!(stdout.contains("Aborted"), "{stdout}");
+
+    // Declining must leave the system untouched: the base must not have run.
+    let systemctl = fs::read_to_string(&systemctl_log).unwrap_or_default();
+    assert!(
+        !systemctl.contains("daemon-reload"),
+        "declining must not run the base (no daemon reload): {systemctl}"
+    );
+    let podman = fs::read_to_string(&podman_log).unwrap_or_default();
+    assert!(
+        !podman.contains("secret rm demo_secret") && !podman.contains("volume rm"),
+        "a declined confirmation must remove nothing: {podman}"
+    );
+}
+
+#[test]
+fn purge_absent_secret_warns_and_continues() {
+    let root = TestDir::new("purge-secret-absent");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    let systemctl_log = root.path().join("systemctl.log");
+    let podman_log = root.path().join("podman.log");
+    fs::create_dir_all(&home).expect("failed to create home");
+    fs::create_dir_all(&bin).expect("failed to create bin");
+    fake_systemctl(&bin, &systemctl_log);
+    let script = format!(
+        "#!/bin/sh\necho \"$@\" >> {log}\nif [ \"$3\" = \"gone\" ]; then echo 'no such secret' >&2; exit 125; fi\nexit 0\n",
+        log = podman_log.display()
+    );
+    let podman = bin.join("podman");
+    write_file(&podman, &script);
+    fs::set_permissions(&podman, fs::Permissions::from_mode(0o755))
+        .expect("failed to chmod fake podman");
+    let path = prepend_path(&bin);
+
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "demo",
+            &[("demo.container", "[Container]\nSecret=gone\nSecret=kept\n")],
+        )],
+    );
+    let stack = stacks.join("demo");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &["purge", "--secrets", "--yes", "--stacks-root", stacks_arg],
+    );
+    assert!(
+        output.status.success(),
+        "an absent secret must not abort the purge: {output:?}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to remove secret 'gone'"),
+        "purge must warn about the absent secret: {stderr}"
+    );
+
+    let podman = fs::read_to_string(&podman_log).expect("missing podman log");
+    assert!(podman.contains("secret rm gone"), "{podman}");
+    assert!(podman.contains("secret rm kept"), "{podman}");
+}
