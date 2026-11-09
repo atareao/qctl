@@ -1,20 +1,20 @@
 # HANDOFF — qctl
 
-## Estado (2026-11-07)
+## Estado (2026-11-09)
 
-- **Release v0.6.2 (patch): PUBLICADO.**
-  - Rama `release/0.6.2` desde `develop` (PR **#28** → `main`); bump 0.6.1 → 0.6.2 (.vampus.yml + Cargo.toml).
-  - Contenido: 🐛 fix(check) detección multi-path del generador quadlet (PR #27).
-  - GitHub Release `v0.6.2` → workflow verde → assets `qctl-linux-x86_64` + `.sha256`. Merge-back a `develop` hecho.
-- **Cambio `detect-quadlet-generator`: COMPLETADO y ARCHIVADO.** PR **#27** → `develop`; auditado (@rust-reviewer: NO APTO inicial → cerrados, 16 unit + 86 integración); archivado.
-- **`new_atareao` ACTUALIZADO — usuario `runner` (uid 1002), ya NO `podman` (PLAN-008 COMPLETADO y ARCHIVADO).**
-  - Rename `podman` → `runner` ejecutado: `usermod -l runner podman` + `usermod -d /home/runner -m runner`; UID 1002 constante.
-  - subuid/subgid reconfigurados a mano; 7 symlinks de systemd relinkeados (ROTOS=0); `db.sql` de podman migrado a `/home/runner`; linger migrado; 4 volúmenes intactos.
-  - **traefik**: reparado (secreto `cf_dns_api_token` del driver file apuntaba a `/home/podman/.../filedriver` en `secrets.json`). Up healthy.
-  - **pocketid**: clave de cifrado del `kv` irrecuperable → regeneradas `jwt_private_key.json`/`session_key.json` (backup DB `.PLAN008.bak`). Up healthy. Admin `atareao` re-autenticado con passkey; datos preservados.
-  - **errserve**: healthy.
-  - Verificado: `qctl check` 0.6.2 exit 0 (2 WARN no bloqueantes de naming); `https://auth.servidorlinux.es/` → 200; los 3 contenedores healthy vía systemd user.
-  - yadm operativo (`core.worktree` corregido a `/home/runner`); subuid/subgid/DB/secrets sin rutas viejas.
+- Rama `feature/fix-purge-data-symlinks` creada desde `develop`.
+- **Fix issue #31** (escape de `$HOME` en `purge --data` por symlink): TDD RED→GREEN→REFACTOR.
+  - Change OpenSpec `fix-purge-data-symlinks` (validado `--strict`) · `plans/PLAN-004.md` · `docs/purge.md` actualizado.
+  - **Auditoría `@rust-reviewer`: NO APTO → corregido → APTO.**
+  - Suite **32 unit + 103 integración**; fmt/clippy limpios.
+- **PR #33 → `develop` ABIERTO**: https://github.com/atareao/qctl/pull/33
+- Histórico: v0.6.2 y v0.7.0 (`qctl purge`) publicadas y desplegadas; v0.7.0 en producción (`runner`, `~/.local/bin/qctl`).
+
+## Detalle técnico del cambio (doble barrera en `--data`)
+
+- `resolve_bind_source` (léxica) + `resolve_real_bind` (`fs::canonicalize` + contención estricta contra `$HOME` canónico).
+- Devuelve `BindReal::{Accepted, Escapes, Unresolvable}`; se borra el **path real resuelto**.
+- Fail-closed si `$HOME` no canonicaliza.
 
 ## Wrapper `rr` (acceso a producción)
 
@@ -35,26 +35,15 @@ Reglas: nunca SSH directo como `runner`; siempre `lorenzo` → `rr`. `runner` no
 
 ## Tarea pendiente
 
-- **Ninguna en `qctl`.** Release **v0.7.0** PUBLICADA y desplegada (local + producción).
-- Cero issues abiertos salvo el follow-up **#31** (`--data` vs symlinks internos).
-
-## Release v0.7.0 (minor)
-
-- Rama `release/0.7.0` desde `develop`; bump `0.6.2 → 0.7.0` (`.vampus.yml` + `Cargo.toml`, `vampus upgrade --minor`). PR **#32** → `main`.
-- **Tag `v0.7.0`** + merge-back a `develop` hechos. **GitHub Release v0.7.0** → `release.yml` verde → assets `qctl-linux-x86_64` + `.sha256`.
-- Contenido: ✨ `qctl purge` (issue #29, PR #30) + docs (`docs/purge.md`, README).
-- **Despliegue**:
-  - Local: `cargo install --path . --force` → `~/.cargo/bin/qctl` 0.7.0.
-  - Producción `new_atareao` (usuario `runner`): asset descargado, `sha256` verificado, instalado en `~/.local/bin/qctl` (**0.7.0**); backup del 0.6.2 en `~/qctl.bak-0.6.2`. `qctl purge --help` OK.
-- **Follow-up #31**: `--data` no resuelve symlinks (normalización léxica) → endurecer con `canonicalize` + contención contra `$HOME` canónico.
-
-## Verificación
-`cargo test` (16 unit + 86 integración) · fmt/clippy/validate verdes · release workflow verde.
+- Revisar/mergear **PR #33**.
+- Tras el merge: `openspec archive fix-purge-data-symlinks` y cerrar **#31**.
+- Release prevista: **patch (0.7.x)**.
 
 ## Reglas / notas
+
 - Gitflow: PR a `develop`; PR a `main` solo desde `release/*`/`hotfix/*` (branch-guard). Commits gitmoji. `Cargo.lock` ignorado.
 - **`.vampus.yml` fuente de verdad de versión** (editar ahí + propagar Cargo.toml); `git flow release start/publish/finish`.
 - Escritor fiable: **`backend-dev`** (el `plan-writer` no dispone de `write`). NO pasar el parámetro `model` a los subagentes.
-- **`host new_atareao` = Ubuntu 26.04 (vmi3651091)**: producción bajo el usuario **`runner`** (uid 1002, antes `podman`), shell fish, yadm + stacks root (`~/.config/containers/available`, **128** stacks) + `systemd` user en `/home/runner`. qctl en `~runner/.local/bin/qctl` (0.6.2).
+- **`host new_atareao` = Ubuntu 26.04 (vmi3651091)**: producción bajo el usuario **`runner`** (uid 1002, antes `podman`), shell fish, yadm + stacks root (`~/.config/containers/available`, **128** stacks) + `systemd` user en `/home/runner`. qctl en `~runner/.local/bin/qctl` (0.7.0).
 - Comando de acceso rápido: **`rr "<cmd>"`** (wrapper, ver arriba) — `XDG_RUNTIME_DIR=/run/user/1002`, `SOPS_AGE_KEY_FILE=~/.secrets/sops/age/key.txt`, `PATH` con `~/.local/bin` ya exportados.
 - Para instalar ficheros como runner en /tmp ajeno: usar `install -m 0755` (cp), nunca `mv` (sticky bit).
