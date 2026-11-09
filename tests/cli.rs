@@ -3720,6 +3720,229 @@ fn purge_data_uses_podman_unshare_for_mapped_uid() {
 }
 
 #[test]
+fn purge_data_does_not_follow_intermediate_symlink_escaping_home() {
+    let root = TestDir::new("purge-data-intermediate-symlink");
+    let (home, path, _systemctl_log, _podman_log) = purge_sandbox(root.path());
+
+    // `home/.config/navidrome` is a symlink pointing outside `$HOME`; the bind
+    // reached through it must never be deleted.
+    let external = root.path().join("external");
+    let external_data = external.join("navidrome").join("data");
+    fs::create_dir_all(&external_data).expect("failed to create external bind dir");
+    let config = home.join(".config");
+    fs::create_dir_all(&config).expect("failed to create home/.config");
+    symlink(external.join("navidrome"), config.join("navidrome"))
+        .expect("failed to create intermediate symlink");
+
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "demo",
+            &[(
+                "demo.container",
+                "[Container]\nImage=example\n\
+                 Volume=%h/.config/navidrome/data:/data:Z\n",
+            )],
+        )],
+    );
+    let stack = stacks.join("demo");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &["purge", "--data", "--yes", "--stacks-root", stacks_arg],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    assert!(
+        external_data.exists(),
+        "purge --data must not delete a bind reached through a symlink escaping $HOME"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("escapes $HOME"),
+        "purge --data must warn about the escaping bind: {stderr}"
+    );
+}
+
+#[test]
+fn purge_data_removes_internal_symlink_that_stays_under_home() {
+    let root = TestDir::new("purge-data-internal-symlink");
+    let (home, path, _systemctl_log, _podman_log) = purge_sandbox(root.path());
+
+    // `home/.config/link` points at `home/.config/real`: both stay under `$HOME`,
+    // so the bind must still be removed.
+    let config = home.join(".config");
+    let real_data = config.join("real").join("data");
+    fs::create_dir_all(&real_data).expect("failed to create real bind dir");
+    symlink(config.join("real"), config.join("link")).expect("failed to create internal symlink");
+
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "demo",
+            &[(
+                "demo.container",
+                "[Container]\nImage=example\n\
+                 Volume=%h/.config/link/data:/data:Z\n",
+            )],
+        )],
+    );
+    let stack = stacks.join("demo");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &["purge", "--data", "--yes", "--stacks-root", stacks_arg],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    assert!(
+        !real_data.exists(),
+        "purge --data must remove a bind that resolves under $HOME"
+    );
+}
+
+#[test]
+fn purge_data_does_not_follow_leaf_symlink_outside_home() {
+    let root = TestDir::new("purge-data-leaf-symlink");
+    let (home, path, _systemctl_log, _podman_log) = purge_sandbox(root.path());
+
+    // The bind source itself is a leaf symlink pointing outside `$HOME`.
+    let external_leaf = root.path().join("external").join("leafdata");
+    fs::create_dir_all(&external_leaf).expect("failed to create external leaf dir");
+    let config = home.join(".config");
+    fs::create_dir_all(&config).expect("failed to create home/.config");
+    symlink(&external_leaf, config.join("leafdata")).expect("failed to create leaf symlink");
+
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "demo",
+            &[(
+                "demo.container",
+                "[Container]\nImage=example\n\
+                 Volume=%h/.config/leafdata:/data:Z\n",
+            )],
+        )],
+    );
+    let stack = stacks.join("demo");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &["purge", "--data", "--yes", "--stacks-root", stacks_arg],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    assert!(
+        external_leaf.exists(),
+        "purge --data must not delete a leaf symlink outside $HOME"
+    );
+}
+
+#[test]
+fn purge_data_does_not_follow_symlink_with_mapped_uid() {
+    let root = TestDir::new("purge-data-symlink-unshare");
+    let (home, path, _systemctl_log, podman_log) = purge_sandbox(root.path());
+
+    // `home/.config/navidrome` is a symlink pointing outside `$HOME`; with a
+    // mapped uid the deletion would go through `podman unshare rm -rf`, which
+    // must never target the external real path.
+    let external = root.path().join("external");
+    let external_data = external.join("navidrome").join("data");
+    fs::create_dir_all(&external_data).expect("failed to create external bind dir");
+    let config = home.join(".config");
+    fs::create_dir_all(&config).expect("failed to create home/.config");
+    symlink(external.join("navidrome"), config.join("navidrome"))
+        .expect("failed to create intermediate symlink");
+
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "demo",
+            &[(
+                "demo.container",
+                "[Container]\nImage=example\nUser=1000:1000\n\
+                 Volume=%h/.config/navidrome/data:/data:Z\n",
+            )],
+        )],
+    );
+    let stack = stacks.join("demo");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &["purge", "--data", "--yes", "--stacks-root", stacks_arg],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    assert!(
+        external_data.exists(),
+        "purge --data must not delete a mapped-uid bind reached through a symlink escaping $HOME"
+    );
+    let podman = fs::read_to_string(&podman_log).unwrap_or_default();
+    assert!(
+        !podman.contains(&format!("rm -rf {}", external_data.display())),
+        "the external real path must never be handed to rm: {podman}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("escapes $HOME"),
+        "purge --data must warn that the real path escapes $HOME: {stderr}"
+    );
+}
+
+#[test]
+fn purge_data_missing_bind_warns_and_continues() {
+    let root = TestDir::new("purge-data-missing");
+    let (home, path, _systemctl_log, _podman_log) = purge_sandbox(root.path());
+    let stacks = stacks_root_with(
+        root.path(),
+        &[(
+            "demo",
+            &[(
+                "demo.container",
+                "[Container]\nImage=example\n\
+                 Volume=%h/.config/demo/present:/present:Z\n\
+                 Volume=%h/.config/demo/absent:/absent:Z\n",
+            )],
+        )],
+    );
+    let present = home.join(".config").join("demo").join("present");
+    fs::create_dir_all(&present).expect("failed to create present bind dir");
+    // `absent` is declared but never created: its real path cannot be resolved.
+    let stack = stacks.join("demo");
+    let stacks_arg = stacks.to_str().expect("stacks root must be utf8");
+
+    let output = run_qctl_with_path(
+        &home,
+        &stack,
+        Path::new(&path),
+        &["purge", "--data", "--yes", "--stacks-root", stacks_arg],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    assert!(
+        !present.exists(),
+        "purge --data must still remove the resolvable bind when another one is missing"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot resolve its real path"),
+        "purge --data must warn about the unresolvable bind: {stderr}"
+    );
+}
+
+#[test]
 fn purge_dry_run_prints_plan_without_calling_podman() {
     let root = TestDir::new("purge-dry-run");
     let (home, path, _systemctl_log, podman_log) = purge_sandbox(root.path());
