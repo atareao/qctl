@@ -2,8 +2,13 @@
 
 ## Estado (2026-11-09)
 
-- **#31 RESUELTO y CERRADO.** PR **#33** mergeado en `develop`; change `fix-purge-data-symlinks` **archivado** (`openspec/changes/archive/2026-11-09-fix-purge-data-symlinks`, spec `purge` actualizada: +1 added, ~1 modified); `PLAN-004` archivado; issue #31 cerrado. Fix `purge --data`: doble barrera (`resolve_bind_source` léxica + `resolve_real_bind` canónica vía `BindReal`), borra el path real resuelto, fail-closed si `$HOME` no canonicaliza. Suite 32 unit + 103 integración.
-- Histórico: v0.6.2 y v0.7.0 (`qctl purge`) publicadas y desplegadas; v0.7.0 en producción (`runner`, `~/.local/bin/qctl`).
+Fecha: 2026-11-09.
+
+- **Release v0.7.1 (patch): PUBLICADO y DESPLEGADO.**
+  - Rama `release/0.7.1` desde `develop`; bump `0.7.0 → 0.7.1` (`vampus upgrade --patch`, `.vampus.yml` + `Cargo.toml`). PR **#34** → `main`.
+  - **Tag `v0.7.1`** + merge-back a `develop` hechos (`git flow release finish`). GitHub Release `v0.7.1` → `release.yml` verde → assets `qctl-linux-x86_64` + `.sha256`.
+  - Contenido: 🐛 fix(purge) `--data` resuelve symlinks antes de borrar (issue #31, PR #33).
+  - **Despliegue**: Local `cargo install --path . --force` → `~/.cargo/bin/qctl` **0.7.1**. Producción `new_atareao` (usuario `runner`, vía `rr`): asset descargado, `sha256` verificado, `install -m 0755` → `~/.local/bin/qctl` **0.7.1**; backup `~/qctl.bak-0.7.0`. Verificado `qctl --version` + `purge --data` presente.
 
 ## Detalle técnico del cambio (doble barrera en `--data`)
 
@@ -30,7 +35,7 @@ Reglas: nunca SSH directo como `runner`; siempre `lorenzo` → `rr`. `runner` no
 
 ## Tarea pendiente
 
-- **release patch 0.7.x** (rama `release/0.7.x` desde `develop` → PR a `main`; bump `.vampus.yml` + `Cargo.toml`). Cero issues abiertos.
+**Ninguna en `qctl`.** Cero issues abiertos.
 
 ## Reglas / notas
 
