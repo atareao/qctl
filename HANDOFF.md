@@ -35,10 +35,18 @@ Reglas: nunca SSH directo como `runner`; siempre `lorenzo` → `rr`. `runner` no
 
 ## Tarea pendiente
 
-- **Ninguna en `qctl`.** Comando `qctl purge` (issue #29) MERGEADO en `develop` (PR #30, squash). Cambio OpenSpec `purge-command` ARCHIVADO en `openspec/specs/purge/`; `plans/PLAN-003-ARCHIVED.md`.
-- **Issue #29 cerrado.**
-- Resto: `develop` por delante de `main` (v0.6.2) — `purge` irá en el próximo release.
-- **Handoff cruzado `self-hosted-podman`: PLAN-008 CERRADO y docs publicadas.** Queda solo el WARN no bloqueante de naming (`proxy.network` en stack traefik y `security.network` en vector) del `qctl check`, para una sesión futura de limpieza — no es un bloqueo.
+- **Ninguna en `qctl`.** Release **v0.7.0** PUBLICADA y desplegada (local + producción).
+- Cero issues abiertos salvo el follow-up **#31** (`--data` vs symlinks internos).
+
+## Release v0.7.0 (minor)
+
+- Rama `release/0.7.0` desde `develop`; bump `0.6.2 → 0.7.0` (`.vampus.yml` + `Cargo.toml`, `vampus upgrade --minor`). PR **#32** → `main`.
+- **Tag `v0.7.0`** + merge-back a `develop` hechos. **GitHub Release v0.7.0** → `release.yml` verde → assets `qctl-linux-x86_64` + `.sha256`.
+- Contenido: ✨ `qctl purge` (issue #29, PR #30) + docs (`docs/purge.md`, README).
+- **Despliegue**:
+  - Local: `cargo install --path . --force` → `~/.cargo/bin/qctl` 0.7.0.
+  - Producción `new_atareao` (usuario `runner`): asset descargado, `sha256` verificado, instalado en `~/.local/bin/qctl` (**0.7.0**); backup del 0.6.2 en `~/qctl.bak-0.6.2`. `qctl purge --help` OK.
+- **Follow-up #31**: `--data` no resuelve symlinks (normalización léxica) → endurecer con `canonicalize` + contención contra `$HOME` canónico.
 
 ## Verificación
 `cargo test` (16 unit + 86 integración) · fmt/clippy/validate verdes · release workflow verde.
