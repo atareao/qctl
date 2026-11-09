@@ -1522,11 +1522,44 @@ async fn remove_images(ctx: &AppContext, images: &[String]) {
 }
 
 /// Removes the eligible bind directories, using `podman unshare rm -rf` when the
-/// declaring quadlet maps a uid and a plain `rm -rf` otherwise. Entries that are
-/// not directories are skipped; a failure warns and continues.
+/// declaring quadlet maps a uid and a plain `rm -rf` otherwise. A bind is only
+/// removed after its real path is proven to be a strict descendant of the
+/// canonical `$HOME`; entries that escape it or are not directories are skipped.
+/// A failure warns and continues.
 async fn remove_binds(ctx: &AppContext, mounts: &[VolumeMount]) {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        warn!("cannot verify bind containment: $HOME is not set; skipping all data paths");
+        return;
+    };
+    let Ok(home_canon) = std::fs::canonicalize(&home) else {
+        warn!(
+            "cannot verify bind containment: failed to canonicalize {}; skipping all data paths",
+            home.display()
+        );
+        return;
+    };
+
     for mount in mounts {
-        let is_dir = fs::metadata(&mount.source)
+        let real = match resolve_real_bind(&mount.source, &home_canon) {
+            BindReal::Unresolvable => {
+                warn!(
+                    "skipping {}: cannot resolve its real path (missing or unreadable)",
+                    mount.source.display()
+                );
+                continue;
+            }
+            BindReal::Escapes(real) => {
+                warn!(
+                    "skipping {}: real path {} escapes $HOME",
+                    mount.source.display(),
+                    real.display()
+                );
+                continue;
+            }
+            BindReal::Accepted(real) => real,
+        };
+
+        let is_dir = fs::metadata(&real)
             .await
             .map(|meta| meta.is_dir())
             .unwrap_or(false);
@@ -1535,7 +1568,10 @@ async fn remove_binds(ctx: &AppContext, mounts: &[VolumeMount]) {
             continue;
         }
 
-        let path = mount.source.to_string_lossy().to_string();
+        // Delete the resolved real path, not `mount.source`, so a symlink swapped
+        // in after resolution cannot redirect the deletion outside `$HOME`
+        // (closes the TOCTOU).
+        let path = real.to_string_lossy().to_string();
         let result = if mount.uid_mapped {
             run_command(
                 "podman",
@@ -1549,11 +1585,8 @@ async fn remove_binds(ctx: &AppContext, mounts: &[VolumeMount]) {
         };
 
         match result {
-            Ok(()) => debug!("Removed data path: {}", mount.source.display()),
-            Err(e) => warn!(
-                "failed to remove {} (continuing): {e:#}",
-                mount.source.display()
-            ),
+            Ok(()) => debug!("Removed data path: {}", real.display()),
+            Err(e) => warn!("failed to remove {} (continuing): {e:#}", real.display()),
         }
     }
 }
@@ -2354,6 +2387,29 @@ fn resolve_bind_source(source: &str, home: Option<&Path>) -> Option<PathBuf> {
     (resolved != home && resolved.starts_with(&home)).then_some(resolved)
 }
 
+/// Outcome of resolving a bind source's on-disk real path for `--data`.
+enum BindReal {
+    /// Canonical real path that is a strict descendant of `home_canon`: safe to delete.
+    Accepted(PathBuf),
+    /// Canonical real path that equals or escapes `home_canon`: must be skipped.
+    Escapes(PathBuf),
+    /// The path could not be canonicalized (missing or unreadable).
+    Unresolvable,
+}
+
+/// Resolves the on-disk real path of `source` and classifies it against
+/// `home_canon` (which MUST already be canonical). Follows every symlink (leaf
+/// and intermediate) and is the second barrier after the lexical
+/// [`resolve_bind_source`]. The real path is returned even when it escapes, so
+/// callers can name it in the warning.
+fn resolve_real_bind(source: &Path, home_canon: &Path) -> BindReal {
+    match std::fs::canonicalize(source) {
+        Ok(real) if real != home_canon && real.starts_with(home_canon) => BindReal::Accepted(real),
+        Ok(real) => BindReal::Escapes(real),
+        Err(_) => BindReal::Unresolvable,
+    }
+}
+
 /// Lexically normalizes a path: drops `.` components and resolves `..` against
 /// the previous component, without touching the filesystem. A leading root is
 /// preserved so an absolute path can never be collapsed into a relative one.
@@ -2853,6 +2909,136 @@ mod tests {
         let mounts = parse_volume_binds("[Container]\nVolume=%h/.config/nav/data:/data:Z\n");
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].source, home.join(".config/nav/data"));
+    }
+
+    /// A scratch directory for the `resolve_real_bind` unit tests. It lives under
+    /// the OS temp dir and is removed on drop, so the tests never touch the
+    /// host's real filesystem layout.
+    struct RealPathTestDir {
+        path: PathBuf,
+    }
+
+    impl RealPathTestDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("qctl-real-bind-test-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("failed to create real-bind test dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for RealPathTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn resolve_real_bind_accepts_bind_under_home() {
+        let dir = RealPathTestDir::new("accepts-under-home");
+        let home = dir.path.join("home");
+        let data = home.join(".config").join("demo").join("data");
+        std::fs::create_dir_all(&data).expect("failed to create data dir");
+        let home_canon = std::fs::canonicalize(&home).expect("failed to canonicalize home");
+
+        let resolved = resolve_real_bind(&data, &home_canon);
+        assert!(
+            matches!(resolved, BindReal::Accepted(_)),
+            "bind under home must be accepted"
+        );
+        let BindReal::Accepted(resolved) = resolved else {
+            unreachable!();
+        };
+        assert!(
+            resolved.starts_with(&home_canon),
+            "resolved {resolved:?} must be under {home_canon:?}"
+        );
+        assert!(resolved.ends_with(Path::new(".config/demo/data")));
+    }
+
+    #[test]
+    fn resolve_real_bind_rejects_intermediate_symlink_escaping_home() {
+        let dir = RealPathTestDir::new("rejects-intermediate");
+        let home = dir.path.join("home");
+        let external = dir.path.join("external");
+        std::fs::create_dir_all(home.join(".config")).expect("failed to create home/.config");
+        std::fs::create_dir_all(external.join("data")).expect("failed to create external/data");
+        std::os::unix::fs::symlink(&external, home.join(".config").join("navidrome"))
+            .expect("failed to create intermediate symlink");
+        let home_canon = std::fs::canonicalize(&home).expect("failed to canonicalize home");
+
+        let source = home.join(".config").join("navidrome").join("data");
+        let expected = std::fs::canonicalize(external.join("data"))
+            .expect("failed to canonicalize external/data");
+        match resolve_real_bind(&source, &home_canon) {
+            BindReal::Escapes(real) => assert_eq!(
+                real, expected,
+                "an intermediate symlink escaping $HOME must report the real external path"
+            ),
+            _ => panic!("an intermediate symlink escaping $HOME must be rejected"),
+        }
+    }
+
+    #[test]
+    fn resolve_real_bind_accepts_internal_symlink_under_home() {
+        let dir = RealPathTestDir::new("accepts-internal");
+        let home = dir.path.join("home");
+        let real = home.join("real");
+        std::fs::create_dir_all(real.join("data")).expect("failed to create home/real/data");
+        std::os::unix::fs::symlink(&real, home.join("link"))
+            .expect("failed to create internal symlink");
+        let home_canon = std::fs::canonicalize(&home).expect("failed to canonicalize home");
+
+        let resolved = resolve_real_bind(&home.join("link").join("data"), &home_canon);
+        assert!(
+            matches!(resolved, BindReal::Accepted(_)),
+            "an internal symlink staying under $HOME must be accepted"
+        );
+        let BindReal::Accepted(resolved) = resolved else {
+            unreachable!();
+        };
+        assert!(
+            resolved.starts_with(&home_canon),
+            "resolved {resolved:?} must be under {home_canon:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_real_bind_rejects_leaf_symlink_outside_home() {
+        let dir = RealPathTestDir::new("rejects-leaf");
+        let home = dir.path.join("home");
+        let external = dir.path.join("external");
+        std::fs::create_dir_all(home.join(".config")).expect("failed to create home/.config");
+        std::fs::create_dir_all(&external).expect("failed to create external");
+        std::os::unix::fs::symlink(&external, home.join(".config").join("leaf"))
+            .expect("failed to create leaf symlink");
+        let home_canon = std::fs::canonicalize(&home).expect("failed to canonicalize home");
+
+        let source = home.join(".config").join("leaf");
+        assert!(
+            matches!(
+                resolve_real_bind(&source, &home_canon),
+                BindReal::Escapes(_)
+            ),
+            "a leaf symlink pointing outside $HOME must be rejected"
+        );
+    }
+
+    #[test]
+    fn resolve_real_bind_rejects_missing_path() {
+        let dir = RealPathTestDir::new("rejects-missing");
+        let home = dir.path.join("home");
+        std::fs::create_dir_all(&home).expect("failed to create home");
+        let home_canon = std::fs::canonicalize(&home).expect("failed to canonicalize home");
+
+        assert!(
+            matches!(
+                resolve_real_bind(&home.join("nope"), &home_canon),
+                BindReal::Unresolvable
+            ),
+            "a missing path cannot be canonicalized and must be unresolvable"
+        );
     }
 
     #[test]
