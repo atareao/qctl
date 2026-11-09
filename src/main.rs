@@ -105,6 +105,28 @@ enum Commands {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Uninstall the current stack and, with explicit opt-in, remove its
+    /// volumes, secrets, images and host-side bind-mounted data
+    Purge {
+        /// Also remove the stack's named volumes (already part of the base)
+        #[arg(long)]
+        volumes: bool,
+        /// Remove the stack's declared secrets (`podman secret rm`)
+        #[arg(long)]
+        secrets: bool,
+        /// Remove the stack's declared images (`podman rmi`)
+        #[arg(long)]
+        images: bool,
+        /// Remove eligible host-side bind-mount directories under $HOME
+        #[arg(long)]
+        data: bool,
+        /// Remove resources even when another stack still declares them
+        #[arg(long)]
+        force: bool,
+        /// Confirm removal without prompting
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Validate one quadlet file, or audit the whole stacks root when called
     /// without an argument
     Check {
@@ -207,6 +229,14 @@ async fn main() -> Result<()> {
         }
         Commands::Menu { service } => menu(&ctx, service).await?,
         Commands::CleanVolumes { yes } => clean_volumes(&ctx, yes).await?,
+        Commands::Purge {
+            volumes,
+            secrets,
+            images,
+            data,
+            force,
+            yes,
+        } => purge(&ctx, volumes, secrets, images, data, force, yes).await?,
         Commands::Check { quadlet } => match quadlet {
             Some(quadlet) => check_quadlet(&ctx, quadlet).await?,
             None => audit_stacks_root(&ctx).await?,
@@ -1130,6 +1160,404 @@ fn confirm_clean_volumes(volume_names: &[String]) -> Result<bool> {
     Ok(matches!(input.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
+/// One symlink `uninstall` would remove from the target directory, together with
+/// the systemd unit whose service is stopped first.
+struct BaseLink {
+    target: PathBuf,
+    unit: String,
+}
+
+/// Everything `purge` would remove: the base (symlinks + named volumes) plus the
+/// opt-in extras (secrets, images and host-side bind data).
+#[derive(Default)]
+struct PurgePlan {
+    links: Vec<BaseLink>,
+    volumes: Vec<String>,
+    secrets: Vec<String>,
+    images: Vec<String>,
+    binds: Vec<VolumeMount>,
+}
+
+impl PurgePlan {
+    fn is_empty(&self) -> bool {
+        self.links.is_empty()
+            && self.volumes.is_empty()
+            && self.secrets.is_empty()
+            && self.images.is_empty()
+            && self.binds.is_empty()
+    }
+}
+
+/// Where the cross-stack guard leaves a declared secret or image.
+enum Guard {
+    /// No other stack declares it: safe to remove.
+    Removable,
+    /// Another stack still declares it; skip, naming that stack.
+    Shared(String),
+    /// The current stack could not be resolved, so nothing can be proven
+    /// unshared: skip (fail-closed).
+    Unresolved,
+}
+
+/// Uninstalls the current stack and removes the resources selected by the flags.
+///
+/// The base (always included) removes the stack's symlinks (`uninstall`) and its
+/// named volumes (`clean-volumes`); the extra categories (secrets, images,
+/// host-side bind data) are opt-in. The whole plan —base included— is built up
+/// front and a single confirmation is asked before anything is destroyed, so
+/// declining leaves the system untouched. Secrets and images still declared by
+/// another stack under the stacks root are skipped unless `force` is set. `yes`
+/// skips the prompt and `ctx.dry_run` only prints the plan.
+async fn purge(
+    ctx: &AppContext,
+    _volumes: bool,
+    secrets: bool,
+    images: bool,
+    data: bool,
+    force: bool,
+    yes: bool,
+) -> Result<()> {
+    debug!("Purging the current stack");
+
+    let plan = build_purge_plan(ctx, secrets, images, data, force).await?;
+    if plan.is_empty() {
+        debug!("Nothing to purge");
+        return Ok(());
+    }
+
+    if ctx.dry_run {
+        print_dry_run_plan(&plan);
+        return Ok(());
+    }
+
+    if !yes && !confirm_purge(&plan)? {
+        println!("Aborted");
+        return Ok(());
+    }
+
+    // Base first, then the extras. `clean_volumes` is called with `yes = true`
+    // because the single confirmation above already covered the named volumes.
+    uninstall(ctx).await?;
+    clean_volumes(ctx, true).await?;
+
+    remove_secrets(ctx, &plan.secrets).await;
+    remove_images(ctx, &plan.images).await;
+    remove_binds(ctx, &plan.binds).await;
+
+    Ok(())
+}
+
+/// Builds the full purge plan: the base (target symlinks and named volumes) plus
+/// the requested extra categories, applying the cross-stack guard to secrets and
+/// images. An unreadable quadlet degrades to a `warn!` and is skipped so one bad
+/// file cannot abort the whole plan.
+async fn build_purge_plan(
+    ctx: &AppContext,
+    secrets: bool,
+    images: bool,
+    data: bool,
+    force: bool,
+) -> Result<PurgePlan> {
+    let files = collect_quadlets(&ctx.source_dirs).await?;
+
+    let mut plan = PurgePlan {
+        links: collect_base_links(ctx, &files).await?,
+        volumes: volume_names(&files).await,
+        ..PurgePlan::default()
+    };
+
+    let mut declared_secrets: Vec<String> = Vec::new();
+    let mut declared_images: Vec<String> = Vec::new();
+    let mut mounts: Vec<VolumeMount> = Vec::new();
+
+    for path in &files {
+        if extension_of_path(path) != Some("container") {
+            continue;
+        }
+        let content = match fs::read_to_string(path).await {
+            Ok(content) => content,
+            Err(e) => {
+                warn!("cannot read quadlet {}: {e}", path.display());
+                continue;
+            }
+        };
+        if secrets {
+            declared_secrets.extend(parse_secret_names(&content));
+        }
+        if images {
+            if let Some(image) = parse_image_name(&content) {
+                declared_images.push(image);
+            }
+        }
+        if data {
+            mounts.extend(parse_volume_binds(&content));
+        }
+    }
+
+    if secrets || images {
+        let current = current_stack_name(ctx).await;
+        if current.is_none() {
+            warn!(
+                "current stack not resolved under {}; treating every declared secret/image as shared (fail-closed)",
+                ctx.stacks_root.display()
+            );
+        }
+        let resources = scan_stack_resources(&ctx.stacks_root).await?;
+
+        declared_secrets.sort();
+        declared_secrets.dedup();
+        for name in declared_secrets {
+            match classify_guard(
+                &resources,
+                current.as_deref(),
+                &name,
+                ResourceKind::Secret,
+                force,
+            ) {
+                Guard::Removable => plan.secrets.push(name),
+                Guard::Shared(other) => {
+                    println!("skip: secreto '{name}' todavía lo usa la stack '{other}'");
+                }
+                Guard::Unresolved => {
+                    println!("skip: secreto '{name}' (stack actual no resuelta; no se borra)");
+                }
+            }
+        }
+
+        declared_images.sort();
+        declared_images.dedup();
+        for image in declared_images {
+            match classify_guard(
+                &resources,
+                current.as_deref(),
+                &image,
+                ResourceKind::Image,
+                force,
+            ) {
+                Guard::Removable => plan.images.push(image),
+                Guard::Shared(other) => {
+                    println!("skip: imagen '{image}' todavía la usa la stack '{other}'");
+                }
+                Guard::Unresolved => {
+                    println!("skip: imagen '{image}' (stack actual no resuelta; no se borra)");
+                }
+            }
+        }
+    }
+
+    if data {
+        mounts.sort_by(|a, b| a.source.cmp(&b.source));
+        mounts.dedup_by(|a, b| a.source == b.source);
+        plan.binds = mounts;
+    }
+
+    Ok(plan)
+}
+
+/// Target-directory symlinks that `uninstall` would stop and remove, mirroring
+/// its naming so the dry-run plan matches the real execution.
+async fn collect_base_links(ctx: &AppContext, files: &[PathBuf]) -> Result<Vec<BaseLink>> {
+    let mut links = Vec::new();
+    for src in files {
+        let name = basename(src)?;
+        let target = ctx.target_dir.join(&name);
+        let Ok(meta) = fs::symlink_metadata(&target).await else {
+            continue;
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        links.push(BaseLink {
+            unit: generated_unit(&strip_dot_extension(&name), extension_of(&name)),
+            target,
+        });
+    }
+    links.sort_by(|a, b| a.target.cmp(&b.target));
+    Ok(links)
+}
+
+/// Named volumes declared by the stack's `.volume` files. An unreadable file is
+/// warned about and skipped.
+async fn volume_names(files: &[PathBuf]) -> Vec<String> {
+    let mut names = Vec::new();
+    for path in files {
+        if extension_of_path(path) != Some("volume") {
+            continue;
+        }
+        let content = match fs::read_to_string(path).await {
+            Ok(content) => content,
+            Err(e) => {
+                warn!("cannot read quadlet {}: {e}", path.display());
+                continue;
+            }
+        };
+        if let Some(name) = parse_volume_name(&content) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Decides whether a declared secret/image may be removed, applying the
+/// cross-stack guard. `force` bypasses the guard; an unresolved current stack is
+/// fail-closed (treated as shared).
+fn classify_guard(
+    resources: &HashMap<String, StackResources>,
+    current: Option<&str>,
+    resource: &str,
+    kind: ResourceKind,
+    force: bool,
+) -> Guard {
+    if force {
+        return Guard::Removable;
+    }
+    let Some(current) = current else {
+        return Guard::Unresolved;
+    };
+    match other_stack_declaring(resources, current, resource, kind) {
+        Some(other) => Guard::Shared(other),
+        None => Guard::Removable,
+    }
+}
+
+/// Prints every action the plan would take under `--dry-run`, without executing
+/// anything.
+fn print_dry_run_plan(plan: &PurgePlan) {
+    for link in &plan.links {
+        println!("DRY-RUN systemctl --user stop {}", link.unit);
+        println!("DRY-RUN remove {}", link.target.display());
+    }
+    println!("DRY-RUN systemctl --user daemon-reload");
+    for volume in &plan.volumes {
+        println!("DRY-RUN podman volume rm -f {volume}");
+    }
+    for name in &plan.secrets {
+        println!("DRY-RUN podman secret rm {name}");
+    }
+    for image in &plan.images {
+        println!("DRY-RUN podman rmi {image}");
+    }
+    for mount in &plan.binds {
+        println!("{}", dry_run_remove_line(mount));
+    }
+}
+
+/// The `DRY-RUN` line for removing one bind path, picking `podman unshare` when
+/// the declaring quadlet maps a uid.
+fn dry_run_remove_line(mount: &VolumeMount) -> String {
+    if mount.uid_mapped {
+        format!("DRY-RUN podman unshare rm -rf {}", mount.source.display())
+    } else {
+        format!("DRY-RUN rm -rf {}", mount.source.display())
+    }
+}
+
+/// Lists every resource the plan would remove —base included— and asks for a
+/// single confirmation.
+fn confirm_purge(plan: &PurgePlan) -> Result<bool> {
+    println!("This purge will remove:");
+    if !plan.links.is_empty() {
+        println!("  links:");
+        for link in &plan.links {
+            println!("    {}", link.target.display());
+        }
+    }
+    if !plan.volumes.is_empty() {
+        println!("  volumes:");
+        for volume in &plan.volumes {
+            println!("    {volume}");
+        }
+    }
+    if !plan.secrets.is_empty() {
+        println!("  secrets:");
+        for name in &plan.secrets {
+            println!("    {name}");
+        }
+    }
+    if !plan.images.is_empty() {
+        println!("  images:");
+        for image in &plan.images {
+            println!("    {image}");
+        }
+    }
+    if !plan.binds.is_empty() {
+        println!("  data:");
+        for mount in &plan.binds {
+            println!("    {}", mount.source.display());
+        }
+    }
+    print!("Continue? [y/N]: ");
+    io::stdout().flush().context("failed to flush stdout")?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read confirmation")?;
+
+    Ok(matches!(input.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
+/// Removes each declared secret, warning and continuing on a failure (for
+/// example a secret that is already absent).
+async fn remove_secrets(ctx: &AppContext, names: &[String]) {
+    for name in names {
+        match run_command("podman", &["secret", "rm", name], false, ctx.timeout).await {
+            Ok(()) => debug!("Removed secret: {name}"),
+            Err(e) => warn!("failed to remove secret '{name}' (continuing): {e:#}"),
+        }
+    }
+}
+
+/// Removes each declared image, warning and continuing on a failure (for
+/// example an image that is no longer present locally).
+async fn remove_images(ctx: &AppContext, images: &[String]) {
+    for image in images {
+        match run_command("podman", &["rmi", image], false, ctx.timeout).await {
+            Ok(()) => debug!("Removed image: {image}"),
+            Err(e) => warn!("failed to remove image '{image}' (continuing): {e:#}"),
+        }
+    }
+}
+
+/// Removes the eligible bind directories, using `podman unshare rm -rf` when the
+/// declaring quadlet maps a uid and a plain `rm -rf` otherwise. Entries that are
+/// not directories are skipped; a failure warns and continues.
+async fn remove_binds(ctx: &AppContext, mounts: &[VolumeMount]) {
+    for mount in mounts {
+        let is_dir = fs::metadata(&mount.source)
+            .await
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false);
+        if !is_dir {
+            debug!("Skipping {} (not a directory)", mount.source.display());
+            continue;
+        }
+
+        let path = mount.source.to_string_lossy().to_string();
+        let result = if mount.uid_mapped {
+            run_command(
+                "podman",
+                &["unshare", "rm", "-rf", &path],
+                false,
+                ctx.timeout,
+            )
+            .await
+        } else {
+            run_command("rm", &["-rf", &path], false, ctx.timeout).await
+        };
+
+        match result {
+            Ok(()) => debug!("Removed data path: {}", mount.source.display()),
+            Err(e) => warn!(
+                "failed to remove {} (continuing): {e:#}",
+                mount.source.display()
+            ),
+        }
+    }
+}
+
 /// Returns `true` when `path` is a regular file with any execute bit set
 /// (owner, group or other).
 ///
@@ -1813,6 +2241,236 @@ fn parse_image_name(content: &str) -> Option<String> {
     parse_ini_value(content, "Image=")
 }
 
+/// Names of every secret declared by a quadlet's `Secret=` entries.
+///
+/// A `.container` may declare several `Secret=` lines and each value may carry
+/// options after the name (`Secret=my_api_key,type=env,target=API_KEY`). The
+/// name is the text before the first comma; leading indentation and an inline
+/// `#` comment are tolerated. Unlike [`parse_ini_value`], which returns only the
+/// first match, this returns every declaration so a multi-secret quadlet is not
+/// silently truncated. An absent key yields an empty list.
+fn parse_secret_names(content: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in content.lines() {
+        let Some(value) = line.trim_start().strip_prefix("Secret=") else {
+            continue;
+        };
+        let value = value.split('#').next().unwrap_or_default();
+        let name = value.split(',').next().unwrap_or_default().trim();
+        if !name.is_empty() {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// A host-side bind mount declared by a quadlet's `Volume=` entry and eligible
+/// for `purge --data`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VolumeMount {
+    /// Absolute, resolved host path of the bind source.
+    source: PathBuf,
+    /// Whether the declaring quadlet maps a uid (it has a `User=` entry), which
+    /// requires `podman unshare rm -rf` instead of a plain `rm -rf`.
+    uid_mapped: bool,
+}
+
+/// Host-side bind mounts declared by a quadlet's `Volume=` entries.
+///
+/// Only sources that resolve to an absolute path **strictly below** `$HOME`
+/// qualify; the eligible prefixes are `%h/`, `~/`, `$HOME/` and `${HOME}/`.
+/// Named volumes (`<name>.volume`), runtime binds under `%t`, sockets, relative
+/// paths and absolute paths outside `$HOME` are dropped. `uid_mapped` is derived
+/// from the presence of a `User=` entry in the same quadlet.
+fn parse_volume_binds(content: &str) -> Vec<VolumeMount> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_volume_binds(content, home.as_deref())
+}
+
+/// Pure core of [`parse_volume_binds`], with `home` injected so it can be tested
+/// without reading (or mutating) the process environment.
+fn resolve_volume_binds(content: &str, home: Option<&Path>) -> Vec<VolumeMount> {
+    let uid_mapped = parse_ini_value(content, "User=").is_some();
+    let mut mounts = Vec::new();
+
+    for line in content.lines() {
+        let Some(value) = line.trim_start().strip_prefix("Volume=") else {
+            continue;
+        };
+        let value = value.split('#').next().unwrap_or_default().trim();
+        // `source:destination[:options]`: the host path is the first field.
+        let source = value.split(':').next().unwrap_or_default().trim();
+        if let Some(path) = resolve_bind_source(source, home) {
+            mounts.push(VolumeMount {
+                source: path,
+                uid_mapped,
+            });
+        }
+    }
+
+    mounts
+}
+
+/// Resolves one `Volume=` source to an eligible absolute bind path strictly
+/// under `$HOME`, or `None` for a named volume, a runtime (`%t`) path, a socket,
+/// a relative path, a path outside `$HOME`, or `$HOME` itself.
+///
+/// The path is normalized lexically (`.` and `..` resolved on components, never
+/// against the filesystem) **before** the containment check, and the check
+/// requires a strict descendant: `Path::starts_with` alone would accept `$HOME`
+/// itself and would let `..` escape the home directory.
+fn resolve_bind_source(source: &str, home: Option<&Path>) -> Option<PathBuf> {
+    if source.is_empty() {
+        return None;
+    }
+    // Named volumes belong to `clean-volumes`, never to `--data`.
+    if source.ends_with(".volume") {
+        return None;
+    }
+    // Sockets (and, by policy, files) are never removed.
+    if source.ends_with(".sock") {
+        return None;
+    }
+    // The runtime directory (`%t`) holds the podman socket and other ephemeral
+    // state that is not ours to delete: everything under it is off limits.
+    if source.starts_with("%t") {
+        return None;
+    }
+
+    // Only the four documented, unambiguous prefixes are accepted. Requiring the
+    // trailing `/` rejects `%h`, `~`, `$HOME`, `${HOME}` and, crucially, `~user`
+    // (which is not expanded and must never be turned into `$HOME/user`).
+    let rest = source
+        .strip_prefix("%h/")
+        .or_else(|| source.strip_prefix("~/"))
+        .or_else(|| source.strip_prefix("$HOME/"))
+        .or_else(|| source.strip_prefix("${HOME}/"))?;
+    let candidate = home?.join(rest);
+
+    let home = normalize_path(home?);
+    let resolved = normalize_path(&candidate);
+
+    // Strict descendant: never `$HOME` itself, never a sibling reached via `..`.
+    (resolved != home && resolved.starts_with(&home)).then_some(resolved)
+}
+
+/// Lexically normalizes a path: drops `.` components and resolves `..` against
+/// the previous component, without touching the filesystem. A leading root is
+/// preserved so an absolute path can never be collapsed into a relative one.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Secrets and images declared by one stack, used by the cross-stack guard.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StackResources {
+    secrets: Vec<String>,
+    images: Vec<String>,
+}
+
+/// Kind of a resource tracked by the cross-stack guard.
+#[derive(Clone, Copy)]
+enum ResourceKind {
+    Secret,
+    Image,
+}
+
+/// Scans every stack directly under `root`, collecting the secrets and images it
+/// declares across its quadlet files, keyed by stack directory name.
+///
+/// A missing or unreadable root yields an empty map; individual failures are
+/// reported with `warn!` and skipped, so one bad quadlet cannot hide the rest of
+/// the guard.
+async fn scan_stack_resources(root: &Path) -> Result<HashMap<String, StackResources>> {
+    let mut resources: HashMap<String, StackResources> = HashMap::new();
+    let mut stacks = match fs::read_dir(root).await {
+        Ok(stacks) => stacks,
+        Err(e) => {
+            // A silently disabled guard is dangerous: the caller would treat
+            // every resource as unshared and delete it.
+            warn!(
+                "cannot read stacks root {} for the shared-resource guard: {e}",
+                root.display()
+            );
+            return Ok(resources);
+        }
+    };
+
+    while let Some(entry) = stacks.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let stack = entry.file_name().to_string_lossy().to_string();
+        let collected = resources.entry(stack).or_default();
+
+        for dir in stack_quadlet_dirs(&entry.path()) {
+            let mut files = match fs::read_dir(&dir).await {
+                Ok(files) => files,
+                Err(e) => {
+                    warn!("cannot read stack directory {}: {e}", dir.display());
+                    continue;
+                }
+            };
+            while let Some(file) = files.next_entry().await? {
+                let path = file.path();
+                let Some(ext) = extension_of_path(&path) else {
+                    continue;
+                };
+                if !QUADLET_EXTENSIONS.contains(&ext) {
+                    continue;
+                }
+                let Ok(content) = fs::read_to_string(&path).await else {
+                    continue;
+                };
+                collected.secrets.extend(parse_secret_names(&content));
+                if let Some(image) = parse_image_name(&content) {
+                    collected.images.push(image);
+                }
+            }
+        }
+    }
+
+    Ok(resources)
+}
+
+/// The first (sorted) stack other than `current` that still declares `resource`
+/// of the given kind, if any. The caller resolves `current` first: an unresolved
+/// current stack never reaches this function (it is fail-closed upstream).
+fn other_stack_declaring(
+    resources: &HashMap<String, StackResources>,
+    current: &str,
+    resource: &str,
+    kind: ResourceKind,
+) -> Option<String> {
+    let mut stacks: Vec<&String> = resources.keys().collect();
+    stacks.sort();
+
+    for stack in stacks {
+        if stack.as_str() == current {
+            continue;
+        }
+        let declared = match kind {
+            ResourceKind::Secret => resources[stack].secrets.iter().any(|s| s == resource),
+            ResourceKind::Image => resources[stack].images.iter().any(|i| i == resource),
+        };
+        if declared {
+            return Some(stack.clone());
+        }
+    }
+
+    None
+}
+
 async fn daemon_reload(ctx: &AppContext) -> Result<()> {
     if ctx.dry_run {
         println!("DRY-RUN systemctl --user daemon-reload");
@@ -2067,6 +2725,134 @@ mod tests {
             parse_ini_value("\tImage=example:1 # pinned\n", "Image=").as_deref(),
             Some("example:1")
         );
+    }
+
+    #[test]
+    fn parse_secret_names_reads_every_line_and_names_with_options() {
+        let content = "[Container]\n\
+            Secret=plain\n\
+            \tSecret=my_api_key,type=env,target=API_KEY\n\
+            Secret=other # inline note\n\
+            Secret= # empty\n";
+        assert_eq!(
+            parse_secret_names(content),
+            vec!["plain", "my_api_key", "other"]
+        );
+    }
+
+    #[test]
+    fn parse_secret_names_is_empty_when_absent_or_blank() {
+        assert!(parse_secret_names("[Container]\nImage=example\n").is_empty());
+        assert!(parse_secret_names("Secret=\n").is_empty());
+        assert!(parse_secret_names("Secret=   \n").is_empty());
+    }
+
+    #[test]
+    fn parse_volume_binds_resolves_home_and_detects_uid_mapping() {
+        let home = PathBuf::from("/home/tester");
+        let content = "[Container]\nUser=1000:1000\nVolume=%h/.config/nav/data:/data:Z\n";
+        let mounts = resolve_volume_binds(content, Some(home.as_path()));
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(
+            mounts[0].source,
+            PathBuf::from("/home/tester/.config/nav/data")
+        );
+        assert!(mounts[0].uid_mapped);
+    }
+
+    #[test]
+    fn parse_volume_binds_without_user_is_not_uid_mapped() {
+        let home = PathBuf::from("/home/tester");
+        let content = "[Container]\nVolume=%h/.config/nav/data:/data:Z\n";
+        let mounts = resolve_volume_binds(content, Some(home.as_path()));
+        assert_eq!(mounts.len(), 1);
+        assert!(!mounts[0].uid_mapped);
+    }
+
+    #[test]
+    fn parse_volume_binds_expands_home_token() {
+        let home = PathBuf::from("/home/tester");
+        let mounts =
+            resolve_volume_binds("[Container]\nVolume=${HOME}/x:/x\n", Some(home.as_path()));
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].source, PathBuf::from("/home/tester/x"));
+    }
+
+    #[test]
+    fn parse_volume_binds_rejects_home_itself() {
+        let home = PathBuf::from("/home/tester");
+        for source in ["%h", "%h/", "~/", "$HOME", "$HOME/", "${HOME}", "${HOME}/"] {
+            let content = format!("[Container]\nVolume={source}:/x\n");
+            let mounts = resolve_volume_binds(&content, Some(home.as_path()));
+            assert!(
+                mounts.is_empty(),
+                "{source:?} resolves to $HOME and must be rejected: {mounts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_volume_binds_rejects_paths_escaping_home_via_dotdot() {
+        let home = PathBuf::from("/home/tester");
+        for source in [
+            "%h/../../etc",
+            "%h/../..",
+            "%h/../other",
+            "~/../..",
+            "$HOME/../../etc",
+        ] {
+            let content = format!("[Container]\nVolume={source}:/x\n");
+            let mounts = resolve_volume_binds(&content, Some(home.as_path()));
+            assert!(
+                mounts.is_empty(),
+                "{source:?} escapes $HOME and must be rejected: {mounts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_volume_binds_rejects_tilde_user() {
+        let home = PathBuf::from("/home/tester");
+        let mounts =
+            resolve_volume_binds("[Container]\nVolume=~other/x:/x\n", Some(home.as_path()));
+        assert!(
+            mounts.is_empty(),
+            "`~user` is not expanded and must be rejected: {mounts:?}"
+        );
+    }
+
+    #[test]
+    fn parse_volume_binds_normalizes_descendant_paths() {
+        let home = PathBuf::from("/home/tester");
+        let content = "[Container]\nVolume=%h/.config/nav/../nav/data:/data\n";
+        let mounts = resolve_volume_binds(content, Some(home.as_path()));
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(
+            mounts[0].source,
+            PathBuf::from("/home/tester/.config/nav/data")
+        );
+    }
+
+    #[test]
+    fn parse_volume_binds_ignores_sockets_named_volumes_system_and_relative_paths() {
+        let home = PathBuf::from("/home/tester");
+        let content = "[Container]\n\
+            Volume=%t/podman/podman.sock:/var/run/docker.sock:ro\n\
+            Volume=memos-memos.volume:/var/opt/memos:Z\n\
+            Volume=/etc/foo:/etc/foo:ro\n\
+            Volume=relative/data:/data\n";
+        let mounts = resolve_volume_binds(content, Some(home.as_path()));
+        assert!(mounts.is_empty(), "unexpected binds: {mounts:?}");
+    }
+
+    #[test]
+    fn parse_volume_binds_uses_home_from_env() {
+        // The test harness always exports HOME; only read it, never mutate it, so
+        // this cannot race with the other (parallel) unit tests.
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME must be set"));
+        let mounts = parse_volume_binds("[Container]\nVolume=%h/.config/nav/data:/data:Z\n");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].source, home.join(".config/nav/data"));
     }
 
     #[test]
