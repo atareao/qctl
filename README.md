@@ -100,18 +100,20 @@ qctl update [SERVICE]
 qctl status [SERVICE] [--compact] [--project]
 qctl menu [SERVICE]
 qctl clean-volumes [--yes]
+qctl purge [--volumes] [--secrets] [--images] [--data] [--force] [--yes]
 qctl check [QUADLET]
 qctl logs <SERVICE>
 qctl logsf <SERVICE>
 qctl completions <SHELL>
 ```
 
-`--dry-run` afecta a los comandos que modifican el sistema o invocan herramientas externas: `install`, `uninstall`, `reinstall`, `start`, `stop`, `restart`, `update`, `reload` y `clean-volumes`. Estos imprimen las acciones planificadas como `DRY-RUN ...` sin cambiar archivos ni ejecutar acciones mutadoras; la tabla de estado final sí consulta `systemctl --user is-active`:
+`--dry-run` afecta a los comandos que modifican el sistema o invocan herramientas externas: `install`, `uninstall`, `reinstall`, `start`, `stop`, `restart`, `update`, `reload`, `clean-volumes` y `purge`. Estos imprimen las acciones planificadas como `DRY-RUN ...` sin cambiar archivos ni ejecutar acciones mutadoras; la tabla de estado final sí consulta `systemctl --user is-active`:
 
 ```bash
 qctl --dry-run install
 qctl --dry-run start voicebox
 qctl --dry-run clean-volumes
+qctl --dry-run purge --secrets --images --data
 ```
 
 Los comandos de solo consulta (`status`, `logs`, `logsf`, `check`, `completions`) siguen consultando el sistema aunque se use `--dry-run`, porque son de lectura y su utilidad desaparecería al simularlos. `qctl menu --dry-run` también sigue consultando para dibujar la tabla, pero las acciones que mutan (`start`, `stop`, `restart`) respetan `--dry-run`.
@@ -256,6 +258,26 @@ El menú también incluye unidades ya enlazadas en `$HOME/.config/containers/sys
 ## Limpieza de volúmenes
 
 `qctl clean-volumes` elimina los volúmenes de Podman declarados con `VolumeName=` en archivos `.volume`. Por defecto pide confirmación antes de borrar. Usa `--yes` para confirmar desde scripts, o `--dry-run` para ver qué volúmenes se borrarían.
+
+## Purga de un stack
+
+`qctl purge` es la limpieza destructiva declarativa de un stack: sustituye la cadena manual de `uninstall` + varios `podman volume rm` / `secret rm` / `rmi` / `podman unshare rm -rf`. Se ejecuta **desde el directorio del stack** como el resto de comandos.
+
+```bash
+qctl purge                         # uninstall + clean-volumes (lo seguro)
+qctl purge --secrets --images      # + secretos e imágenes declarados por el stack
+qctl purge --secrets --images --data
+qctl purge --data --force --yes    # datos de bind mounts, sin guarda, sin prompt
+```
+
+- **Sin flags** (o `--volumes`): `uninstall` (stop + desenlaza) y `clean-volumes` (volúmenes nombrados declarados). Nada más.
+- **`--secrets`**: `podman secret rm` de cada `Secret=<nombre>[,opciones]` de los `.container`.
+- **`--images`**: `podman rmi` de cada `Image=` de los `.container`.
+- **`--data`**: borra los **bind mounts** host-side declarados en `Volume=`. Solo rutas bajo `$HOME` (con `%h/`, `~/`, `$HOME/` o `${HOME}/`), normalizadas léxicamente: nunca `$HOME` mismo ni escapes por `..`; se ignoran sockets, ficheros, `%t` y rutas de sistema. Con `User=<uid>` en el quadlet usa `podman unshare rm -rf`; si no, `rm -rf`.
+- **Guarda de recursos compartidos**: antes de borrar un secreto o una imagen, escanea el *stacks root* y salta el recurso si **otra** stack lo sigue declarando (`skip: ... todavía lo usa la stack '<otra>'`). `--force` lo ignora. Si la stack actual no se puede resolver, la guarda es *fail-closed*: avisa y no borra.
+- **`--yes`** omite la confirmación (que lista, una sola vez y antes de tocar nada, todo lo que se va a borrar). **`--dry-run`** imprime el plan completo sin ejecutar nada.
+
+Fuera de alcance: no borra los quadlets fuente (igual que `uninstall`) ni gestiona pods ni `.kube`. Ver [docs/purge.md](docs/purge.md).
 
 ## Salida de status
 
