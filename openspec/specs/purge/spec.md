@@ -121,9 +121,10 @@ to `XDG_RUNTIME_DIR` or `/run/user/<uid>`) and remove the resolved directory. It
 remove sockets or files (only directories), MUST NOT remove `%t/podman/podman.sock` or any
 path under `%t`, and MUST NOT remove absolute system paths outside `$HOME`. A path is
 eligible only when it resolves under `$HOME` **strictly below it** (never `$HOME` itself),
-after normalizing `.` and `..` lexically. The eligible source prefixes are `%h/`, `~/`, `$HOME/`
-and `${HOME}/`; relative paths (`./…`) are rejected because their base directory is ambiguous.
-A resolved path that escapes `$HOME` through `..` MUST be rejected.
+after normalizing `.` and `..` lexically **and** after resolving symlinks against the real
+filesystem. The eligible source prefixes are `%h/`, `~/`, `$HOME/` and `${HOME}/`; relative
+paths (`./…`) are rejected because their base directory is ambiguous. A resolved path that
+escapes `$HOME` through `..` or through a symlink MUST be rejected.
 
 #### Scenario: bind under $HOME is removed
 
@@ -158,9 +159,15 @@ A resolved path that escapes `$HOME` through `..` MUST be rejected.
 
 #### Scenario: named volume is not data
 
-- **WHEN** a `.container` declares `Volume=memos-memos.volume:/var/opt/memos:Z` and
-  `--data` is set
+- **WHEN** a `.container` declares `Volume=memos-memos.volume:/var/opt/memos:Z` and `--data`
+  is set
 - **THEN** purge does not treat it as data (named volumes belong to `clean-volumes`)
+
+#### Scenario: symlink escaping $HOME is rejected
+
+- **WHEN** a bind whose lexical path is under `$HOME` resolves, after following symlinks,
+  to a real path outside `$HOME`, and `--data` is set
+- **THEN** purge rejects the entry and removes nothing for it
 
 ### Requirement: purge --data SHALL use podman unshare for mapped-uid directories
 
@@ -231,3 +238,43 @@ reading them for the shared-resource guard).
 
 - **WHEN** the user runs `qctl purge --secrets` and a secret is shared
 - **THEN** the other stack's resources and files are left unmodified
+
+### Requirement: purge --data SHALL resolve symlinks and re-check containment before deleting
+
+Before removing any bind directory, `purge --data` SHALL resolve the on-disk real path and
+re-check containment against the canonical `$HOME`: it SHALL compute
+`home_canon = fs::canonicalize($HOME)` and `real = fs::canonicalize(<bind source>)`, and it
+SHALL delete the resolved real path (`real`) and only when `real` is a strict descendant of
+`home_canon` (never
+`home_canon` itself). When `real` escapes `home_canon`, or when canonicalization fails, purge
+SHALL skip the entry with a `warn!` naming both the declared path and the real target, and
+SHALL NOT delete anything for it. The lexical normalization of `resolve_bind_source` SHALL
+be kept as a first barrier. This verification SHALL apply identically to both `rm -rf` and
+`podman unshare rm -rf`.
+
+#### Scenario: intermediate symlink escaping $HOME is not followed
+
+- **WHEN** `$HOME/.config/navidrome` is a symlink to `/mnt/ssd/navidrome` and a quadlet
+  declares `Volume=%h/.config/navidrome/data:/data:Z`, and `--data` is set
+- **THEN** purge resolves the real path to `/mnt/ssd/navidrome/data`, detects it escapes
+  `$HOME`, warns naming the declared path and the real target, and removes nothing for it
+
+#### Scenario: internal symlinks that stay under $HOME are deleted normally
+
+- **WHEN** a bind's real path, after resolving symlinks, is a strict descendant of the
+  canonical `$HOME`
+- **THEN** purge removes it as usual (with `rm -rf` or `podman unshare rm -rf` per the
+  mapped-uid rule)
+
+#### Scenario: leaf symlink pointing outside $HOME is not followed
+
+- **WHEN** the bind source itself is a symlink whose target is outside `$HOME`, and `--data`
+  is set
+- **THEN** purge resolves the target, detects it escapes `$HOME`, warns, and removes nothing
+  for it
+
+#### Scenario: canonicalization failure skips the entry
+
+- **WHEN** the bind path no longer exists (or cannot be resolved) at deletion time and
+  `--data` is set
+- **THEN** purge warns and skips the entry without aborting the rest of the purge

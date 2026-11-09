@@ -30,4 +30,4 @@
 - [x] 4.1 `cargo test` (unit + integración) verde.
 - [x] 4.2 `openspec validate fix-purge-data-symlinks --strict` verde.
 - [x] 4.3 Auditoría `@rust-reviewer`; corregir hallazgos.
-- [ ] 4.4 PR a `develop` (gitmoji) referenciando #31.
+- [x] 4.4 PR a `develop` (gitmoji) referenciando #31.

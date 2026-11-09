@@ -20,10 +20,10 @@ canónico. Verificación idéntica para `rm -rf` y `podman unshare rm -rf`.
 
 ## Tareas (TDD)
 
-- [ ] 1. RED: unit del helper de canonicalización + integración con symlinks.
-- [ ] 2. GREEN: resolver `$HOME` canónico y verificar contención en `remove_binds`.
-- [ ] 3. REFACTOR: fmt/clippy, docstrings, `docs/purge.md`.
-- [ ] 4. Verificación: `cargo test`, `openspec validate --strict`, auditoría `@rust-reviewer`, PR.
+- [x] 1. RED: unit del helper de canonicalización + integración con symlinks.
+- [x] 2. GREEN: resolver `$HOME` canónico y verificar contención en `remove_binds`.
+- [x] 3. REFACTOR: fmt/clippy, docstrings, `docs/purge.md`.
+- [x] 4. Verificación: `cargo test`, `openspec validate --strict`, auditoría `@rust-reviewer`, PR.
 
 ## Criterios de aceptación
 
