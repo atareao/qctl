@@ -2,12 +2,7 @@
 
 ## Estado (2026-11-09)
 
-- Rama `feature/fix-purge-data-symlinks` creada desde `develop`.
-- **Fix issue #31** (escape de `$HOME` en `purge --data` por symlink): TDD RED→GREEN→REFACTOR.
-  - Change OpenSpec `fix-purge-data-symlinks` (validado `--strict`) · `plans/PLAN-004.md` · `docs/purge.md` actualizado.
-  - **Auditoría `@rust-reviewer`: NO APTO → corregido → APTO.**
-  - Suite **32 unit + 103 integración**; fmt/clippy limpios.
-- **PR #33 → `develop` ABIERTO**: https://github.com/atareao/qctl/pull/33
+- **#31 RESUELTO y CERRADO.** PR **#33** mergeado en `develop`; change `fix-purge-data-symlinks` **archivado** (`openspec/changes/archive/2026-11-09-fix-purge-data-symlinks`, spec `purge` actualizada: +1 added, ~1 modified); `PLAN-004` archivado; issue #31 cerrado. Fix `purge --data`: doble barrera (`resolve_bind_source` léxica + `resolve_real_bind` canónica vía `BindReal`), borra el path real resuelto, fail-closed si `$HOME` no canonicaliza. Suite 32 unit + 103 integración.
 - Histórico: v0.6.2 y v0.7.0 (`qctl purge`) publicadas y desplegadas; v0.7.0 en producción (`runner`, `~/.local/bin/qctl`).
 
 ## Detalle técnico del cambio (doble barrera en `--data`)
@@ -35,9 +30,7 @@ Reglas: nunca SSH directo como `runner`; siempre `lorenzo` → `rr`. `runner` no
 
 ## Tarea pendiente
 
-- Revisar/mergear **PR #33**.
-- Tras el merge: `openspec archive fix-purge-data-symlinks` y cerrar **#31**.
-- Release prevista: **patch (0.7.x)**.
+- **release patch 0.7.x** (rama `release/0.7.x` desde `develop` → PR a `main`; bump `.vampus.yml` + `Cargo.toml`). Cero issues abiertos.
 
 ## Reglas / notas
 
