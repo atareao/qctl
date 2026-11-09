@@ -80,6 +80,12 @@ Solo son candidatos los `Volume=` cuyo *source* sea una **ruta** host (no un vol
   descendiente **estricto** de `$HOME`: nunca `$HOME` mismo, nunca un escape por `..`.
 - Se ignoran sockets y ficheros (solo directorios), todo lo que cuelgue de `%t` (en especial
   `%t/podman/podman.sock`), las rutas de sistema fuera de `$HOME` y las relativas (`./…`).
+- Antes de borrar, se resuelve el **path real en disco** con `fs::canonicalize` y se
+  re-comprueba la contención contra el `$HOME` **canónico**: solo se borra si el path real
+  es descendiente **estricto** de `$HOME`. Se borra el **path real resuelto** (canónico), no
+  la ruta original declarada. La normalización léxica anterior se conserva como
+  primera barrera. Si el path real escapa de `$HOME` (symlink intermedio o en la hoja) o la
+  resolución falla, se avisa con `warn!` y se salta la entrada sin borrar nada.
 - Si el quadlet declara `User=<uid>` (uid mapeado) se borra con `podman unshare rm -rf <ruta>`;
   si no, con `rm -rf <ruta>`.
 
@@ -91,6 +97,7 @@ Ejemplos:
 | `%h/.config/navidrome/music:/music:ro` | borra `$HOME/.config/navidrome/music` |
 | `%t/podman/podman.sock:/var/run/docker.sock:ro` | **ignorado** (socket, `%t`) |
 | `%h:/x`, `$HOME/../../etc:/x` | **ignorados** (igual a `$HOME` / escape por `..`) |
+| `%h/.config/navidrome/data:/data:Z` con `~/.config/navidrome -> /mnt/ssd/navidrome` | **ignorado** (el path real `/mnt/ssd/navidrome/data` escapa de `$HOME`) |
 | `memos-memos.volume:/var/opt/memos:Z` | no es data (volumen nombrado → `clean-volumes`) |
 
 ## Variables / configuración
@@ -112,13 +119,15 @@ extra. La tabla de comandos del `README.md` ya lo documenta.
 - **Confirmación única incluyendo la base**: se confirma antes de ejecutar `uninstall`, para
   que declinar no deje nada borrado.
 - **Fail-closed** cuando la stack actual no se resuelve.
-- **Normalización léxica** de rutas (no sigue symlinks): enfoque documentado y suficiente para
-  el contrato (rechazar `..` y `$HOME` mismo).
+- **Doble barrera** en `--data`: primero normalización léxica (`resolve_bind_source`, rechaza
+  `..` y `$HOME` mismo sin tocar el FS) y después resolución canónica (`resolve_real_bind`:
+  `fs::canonicalize` + contención estricta contra el `$HOME` canónico). Cierra el escape por
+  symlink intermedio (issue #31). Borra el **path real resuelto** (canónico), no la ruta
+  original, para no re-seguir symlinks (cierra el TOCTOU).
 
 ## Follow-ups / limitación conocida
 
-- La normalización de `--data` es léxica: un **symlink dentro de `$HOME`** que apunte fuera
-  (p. ej. `~/.config -> /etc`) no se detecta y el `rm -rf` seguiría el enlace. Fuera del
-  contrato actual; candidato a endurecer en una iteración futura (resolución canónica del
-  path antes de borrar).
+- Un **symlink hoja dentro de `$HOME`** que apunte fuera de `$HOME` no se sigue: se avisa y se
+  salta (issue #31). Un symlink hoja que apunta **dentro** de `$HOME` se resuelve a su destino
+  real y se borra el destino (no el enlace).
 - Pendiente en `self-hosted-podman`: enlazar `docs/gestion-stacks-qctl.md` a `qctl purge`.
